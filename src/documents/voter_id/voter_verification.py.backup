@@ -1,0 +1,1388 @@
+"""
+Voter ID (EPIC) verification core.
+
+Source:
+    Converted from the existing voterVerify.ipynb.
+
+Supported:
+    - Old Voter Identity Card
+    - New e-EPIC card
+    - Image input (JPG/PNG/WEBP)
+
+Pipeline:
+    1. Image preparation / card crop
+    2. Image quality checks
+    3. English + Hindi OCR
+    4. Voter-card detection
+    5. Old/new format detection
+    6. Field extraction
+    7. Weighted final decision
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import cv2
+import numpy as np
+import easyocr
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+_ocr_reader = None
+
+
+def load_ocr_reader():
+    """Load EasyOCR once and reuse it."""
+    global _ocr_reader
+
+    if _ocr_reader is None:
+        _ocr_reader = easyocr.Reader(
+            ["en", "hi"],
+            gpu=False,
+        )
+
+    return _ocr_reader
+
+
+# ============================================================
+# IMAGE PREPARATION
+# ============================================================
+
+def crop_card_from_background(
+    image: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """
+    Detect a card-shaped rectangle and crop background when useful.
+    """
+    h, w = image.shape[:2]
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    best_crop = None
+    best_area = 0.0
+
+    for lo, hi in [(20, 80), (40, 120), (60, 160)]:
+        edges = cv2.Canny(blurred, lo, hi)
+
+        edges = cv2.dilate(
+            edges,
+            np.ones((7, 7), np.uint8),
+            iterations=2,
+        )
+
+        contours, _ = cv2.findContours(
+            edges,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        contours = sorted(
+            contours,
+            key=cv2.contourArea,
+            reverse=True,
+        )[:5]
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area < (h * w) * 0.08:
+                continue
+
+            peri = cv2.arcLength(contour, True)
+
+            approx = cv2.approxPolyDP(
+                contour,
+                0.025 * peri,
+                True,
+            )
+
+            if len(approx) != 4:
+                continue
+
+            x, y, cw, ch = cv2.boundingRect(approx)
+
+            if ch == 0:
+                continue
+
+            ratio = cw / ch
+
+            if 1.2 < ratio < 2.1 and area > best_area:
+                best_crop = (x, y, cw, ch)
+                best_area = area
+
+    if best_crop is None:
+        return image, False
+
+    x, y, cw, ch = best_crop
+    coverage = best_area / (h * w)
+
+    if coverage < 0.80:
+        pad = 12
+
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(w, x + cw + pad)
+        y2 = min(h, y + ch + pad)
+
+        return image[y1:y2, x1:x2], True
+
+    return image, False
+
+
+def load_and_prepare_image(
+    file_bytes: bytes,
+) -> np.ndarray:
+    """Decode uploaded image and crop background when useful."""
+    image_array = np.frombuffer(
+        file_bytes,
+        dtype=np.uint8,
+    )
+
+    image = cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR,
+    )
+
+    if image is None:
+        raise ValueError(
+            "Unable to decode the uploaded image."
+        )
+
+    image, _ = crop_card_from_background(image)
+
+    return image
+
+
+# ============================================================
+# IMAGE QUALITY
+# ============================================================
+
+def check_image_quality(
+    image: np.ndarray,
+) -> tuple[bool, int, int, list[str]]:
+    """
+    Six quality checks.
+
+    Quality problems are returned as warnings. Only conditions that
+    make OCR fundamentally unreliable are treated as hard failures.
+    The quality score still contributes to the final 40% quality weight.
+    """
+    warnings: list[str] = []
+    hard_failure = False
+    score = 0
+    max_score = 0
+
+    h, w = image.shape[:2]
+
+    # 1. Resolution
+    max_score += 10
+
+    if w < 150 or h < 100:
+        warnings.append(
+            f"Image too small ({w}x{h}px)."
+        )
+        hard_failure = True
+    elif w < 400 or h < 250:
+        score += 5
+    else:
+        score += 10
+
+    # 2. Blur
+    max_score += 10
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    blur_val = float(
+        cv2.Laplacian(
+            gray,
+            cv2.CV_64F,
+        ).var()
+    )
+
+    if blur_val < 30:
+        warnings.append(
+            f"Very blurry (score={blur_val:.0f})."
+        )
+        hard_failure = True
+    elif blur_val < 100:
+        score += 5
+    else:
+        score += 10
+
+    # 3. Brightness / contrast
+    max_score += 8
+
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+
+    if brightness < 30:
+        warnings.append(
+            f"Too dark ({brightness:.0f}/255)."
+        )
+        hard_failure = True
+    elif brightness > 235:
+        warnings.append(
+            f"Overexposed ({brightness:.0f}/255)."
+        )
+        hard_failure = True
+    elif contrast < 20:
+        score += 3
+    elif brightness < 60 or brightness > 210:
+        score += 5
+    else:
+        score += 8
+
+    # 4. Glare
+    max_score += 7
+
+    glare_frac = float(
+        np.sum(gray > 245)
+    ) / gray.size
+
+    if glare_frac > 0.15:
+        # Glare is a quality penalty, not an automatic rejection.
+        # OCR/detection must decide whether the document is still usable.
+        warnings.append(
+            f"Heavy glare ({glare_frac * 100:.0f}%)."
+        )
+    elif glare_frac > 0.05:
+        score += 4
+    else:
+        score += 7
+
+    # 5. Noise
+    max_score += 5
+
+    blur_ref = cv2.GaussianBlur(
+        gray.astype(np.float32),
+        (5, 5),
+        0,
+    )
+
+    noise_lvl = float(
+        np.mean(
+            np.abs(
+                gray.astype(np.float32)
+                - blur_ref
+            )
+        )
+    )
+
+    if noise_lvl > 18:
+        warnings.append(
+            f"High noise ({noise_lvl:.1f})."
+        )
+    elif noise_lvl > 10:
+        score += 3
+    else:
+        score += 5
+
+    # 6. Aspect ratio
+    max_score += 5
+
+    ratio = w / h if h > 0 else 0
+
+    # Voter ID images can be portrait or landscape.
+    # Only extreme document proportions should be penalized.
+    if 0.70 <= ratio <= 2.10:
+        score += 5
+    else:
+        warnings.append(
+            f"Unusual aspect ratio ({ratio:.2f})."
+        )
+
+    return (
+        not hard_failure,
+        score,
+        max_score,
+        warnings,
+    )
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+def _normalize_ocr_results(
+    results: list,
+) -> list[dict[str, Any]]:
+    """Convert EasyOCR output to our stable internal representation."""
+    lines: list[dict[str, Any]] = []
+
+    for item in results:
+        if len(item) < 3:
+            continue
+
+        bbox, text, confidence = item
+        clean = str(text).strip()
+
+        if clean:
+            lines.append(
+                {
+                    "text": clean,
+                    "confidence": round(float(confidence), 2),
+                    "bbox": bbox,
+                }
+            )
+
+    return lines
+
+
+def _ocr_signal_score(
+    lines: list[dict[str, Any]],
+) -> int:
+    """Estimate whether OCR produced enough voter-specific information."""
+    text = " ".join(
+        item["text"] for item in lines
+    ).upper()
+
+    score = 0
+
+    strong_signals = (
+        ("ELECTION COMMISSION", 30),
+        ("ELECTORS PHOTO IDENTITY CARD", 35),
+        ("ELECTORS PHOTO", 25),
+        ("VOTER IDENTITY CARD", 30),
+        ("ELECTORS", 15),
+        ("FATHER", 10),
+        ("GENDER", 10),
+        ("DATE OF BIRTH", 10),
+    )
+
+    for keyword, points in strong_signals:
+        if keyword in text:
+            score += points
+
+    return min(score, 100)
+
+
+def extract_text_from_image(
+    image: np.ndarray,
+) -> list[dict[str, Any]]:
+    """
+    Run EasyOCR on the original image first.
+
+    The original Voter sample is recognized better without the aggressive
+    thresholding/median-blur pipeline. A light grayscale fallback is used
+    only when the original OCR produces weak voter-specific signals.
+    """
+    reader = load_ocr_reader()
+
+    # PRIMARY: preserve the original image.
+    primary = _normalize_ocr_results(
+        reader.readtext(
+            image,
+            detail=1,
+        )
+    )
+
+    if _ocr_signal_score(primary) >= 35:
+        return primary
+
+    # FALLBACK: light grayscale enhancement.
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    h, w = gray.shape
+
+    if w < 900:
+        scale = 900 / w
+        gray = cv2.resize(
+            gray,
+            (
+                int(w * scale),
+                int(h * scale),
+            ),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    fallback = _normalize_ocr_results(
+        reader.readtext(
+            gray,
+            detail=1,
+        )
+    )
+
+    if _ocr_signal_score(fallback) > _ocr_signal_score(primary):
+        return fallback
+
+    return primary
+
+
+def get_lines(
+    ocr_results: list[dict[str, Any]],
+) -> list[str]:
+    return [
+        item["text"]
+        for item in ocr_results
+    ]
+
+
+# ============================================================
+# VOTER DETECTION
+# ============================================================
+
+def find_epic_number(
+    text_lines: list[str],
+) -> tuple[str | None, int]:
+    """
+    Detect an EPIC number conservatively.
+
+    We do not invent/correct an OCR value such as ``R8G7134133``.
+    A value is returned only when it matches the expected 3-letter +
+    7-digit structure after safe OCR normalization.
+    """
+    digit_fix = {
+        "O": "0",
+        "I": "1",
+        "L": "1",
+        "S": "5",
+    }
+
+    # Do not silently convert ambiguous OCR characters in a government ID.
+    # EPIC is returned only when OCR produces a sufficiently reliable match.
+    letter_fix = {}
+
+    candidates: list[str] = []
+
+    for raw_line in text_lines:
+        clean = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            raw_line.upper(),
+        )
+
+        # Direct match.
+        if re.fullmatch(
+            r"[A-Z]{3}[0-9]{7}",
+            clean,
+        ):
+            candidates.append(clean)
+            continue
+
+        # Safe OCR normalization only when it yields one valid EPIC.
+        if len(clean) == 10:
+            chars = list(clean)
+
+            for i in range(3):
+                chars[i] = letter_fix.get(
+                    chars[i],
+                    chars[i],
+                )
+
+            for i in range(3, 10):
+                chars[i] = digit_fix.get(
+                    chars[i],
+                    chars[i],
+                )
+
+            normalized = "".join(chars)
+
+            if re.fullmatch(
+                r"[A-Z]{3}[0-9]{7}",
+                normalized,
+            ):
+                candidates.append(normalized)
+
+    if candidates:
+        return candidates[0], 50
+
+    # Partial EPIC-like OCR is useful for detection but must not be exposed
+    # as a verified EPIC number.
+    full_text = " ".join(text_lines).upper()
+
+    partial = re.search(
+        r"[A-Z0-9]{5,12}",
+        re.sub(r"[^A-Z0-9 ]", " ", full_text),
+    )
+
+    return None, 10 if partial else 0
+
+
+def score_voter_keywords(
+    text_lines: list[str],
+) -> tuple[int, list[str]]:
+    full_text = " ".join(
+        text_lines
+    ).upper()
+
+    keyword_weights = [
+        ("ELECTION COMMISSION", 25),
+        ("VOTER IDENTITY CARD", 15),
+        ("ELECTORS PHOTO", 15),
+        ("E-ELECTORS", 15),
+        ("VOTER IDENTITY", 10),
+        ("ELECTORS", 10),
+        ("VOTER", 5),
+        ("INDIA", 3),
+    ]
+
+    total = 0
+    matched = []
+    seen = set()
+
+    for keyword, points in keyword_weights:
+        if (
+            keyword in full_text
+            and keyword not in seen
+        ):
+            total += points
+            matched.append(keyword)
+            seen.add(keyword)
+
+    return min(total, 50), matched
+
+
+def is_voter_card(
+    text_lines: list[str],
+) -> tuple[bool, str | None, int]:
+    epic_number, epic_points = find_epic_number(
+        text_lines
+    )
+
+    keyword_score, matched = score_voter_keywords(
+        text_lines
+    )
+
+    # Add label-based signals that survive common OCR spelling errors.
+    full_text = " ".join(
+        text_lines
+    ).upper()
+
+    label_score = 0
+
+    if "ELECTION" in full_text and "COMMISSION" in full_text:
+        label_score += 20
+
+    if (
+        "ELECTORS" in full_text
+        and "PHOTO" in full_text
+        and (
+            "IDENTITY" in full_text
+            or "IDENTIT" in full_text
+        )
+    ):
+        label_score += 25
+
+    if (
+        "FATHER" in full_text
+        and "GENDER" in full_text
+    ):
+        label_score += 10
+
+    if (
+        "DATE OF BIRTH" in full_text
+        or "AGE" in full_text
+    ):
+        label_score += 10
+
+    detection_score = min(
+        100,
+        epic_points + keyword_score + label_score,
+    )
+
+    # Strong Voter-ID identity text is sufficient for document detection.
+    # EPIC is an extraction field and must not be fabricated when OCR fails.
+    strong_identity = (
+        (
+            "ELECTION" in full_text
+            and "COMMISSION" in full_text
+        )
+        and (
+            "ELECTORS" in full_text
+            or "VOTER" in full_text
+        )
+        and (
+            "PHOTO" in full_text
+            or "IDENTITY" in full_text
+        )
+    )
+
+    confirmed = (
+        detection_score >= 35
+        or strong_identity
+    )
+
+    return (
+        confirmed,
+        epic_number,
+        detection_score,
+    )
+
+
+# ============================================================
+# FORMAT DETECTION
+# ============================================================
+
+NEW_FORMAT_LABELS = [
+    "NAME:",
+    "FATHER'S NAME:",
+    "FATHERS NAME:",
+    "GENDER:",
+    "DATE OF BIRTH",
+    "AGE:",
+]
+
+OLD_FORMAT_LABELS = [
+    "ORIGINAL NAME",
+    "VOTER IDENTITY CARD",
+    "VOTER OF NUMBER",
+    "PART NO",
+]
+
+
+def detect_voter_format(
+    text_lines: list[str],
+) -> str:
+    full_text = " ".join(
+        text_lines
+    ).upper()
+
+    new_count = sum(
+        1
+        for label in NEW_FORMAT_LABELS
+        if label in full_text
+    )
+
+    old_count = sum(
+        1
+        for label in OLD_FORMAT_LABELS
+        if label in full_text
+    )
+
+    if new_count >= 2:
+        return "new"
+
+    if old_count >= 1:
+        return "old"
+
+    if (
+        "ELECTORS PHOTO" in full_text
+        or "E-ELECTORS" in full_text
+    ):
+        return "new"
+
+    return "old"
+
+
+# ============================================================
+# FIELD EXTRACTION - COMMON
+# ============================================================
+
+def find_date_anywhere(
+    text: str,
+) -> str | None:
+    match = re.search(
+        r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})\b",
+        text,
+    )
+
+    if match:
+        return match.group(0)
+
+    match = re.search(
+        r"\b(\d{1,2})[\s\-]?"
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"[a-z]*[\s\-]?(\d{4})\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+# ============================================================
+# NEW FORMAT EXTRACTION
+# ============================================================
+
+def extract_inline_field(
+    text_lines: list[str],
+    label_variants: list[str],
+) -> str | None:
+    for line in text_lines:
+        upper = line.upper()
+
+        for label in label_variants:
+            if label in upper:
+                parts = upper.split(
+                    label,
+                    1,
+                )
+
+                if len(parts) <= 1:
+                    continue
+
+                value = (
+                    parts[1]
+                    .strip()
+                    .lstrip(":")
+                    .lstrip("/")
+                    .strip()
+                )
+
+                value_clean = re.sub(
+                    r"[^\x00-\x7F]+",
+                    "",
+                    value,
+                ).strip()
+
+                if (
+                    value_clean
+                    and len(value_clean) > 1
+                ):
+                    return value_clean.title()
+
+    return None
+
+
+def extract_name_new(
+    text_lines: list[str],
+) -> str | None:
+    value = extract_inline_field(
+        text_lines,
+        ["NAME:", "NAME :"],
+    )
+
+    if value and "FATHER" not in value.upper():
+        return value
+
+    for line in text_lines:
+        if "नाम" in line and "पिता" not in line:
+            if ":" in line:
+                value = line.split(
+                    ":",
+                    1,
+                )[-1].strip()
+
+                value = re.sub(
+                    r"[^\x00-\x7F]+",
+                    "",
+                    value,
+                ).strip()
+
+                if len(value) > 2:
+                    return value.title()
+
+    return None
+
+
+def extract_father_new(
+    text_lines: list[str],
+) -> str | None:
+    value = extract_inline_field(
+        text_lines,
+        [
+            "FATHER'S NAME:",
+            "FATHERS NAME:",
+            "FATHER'S NAME :",
+            "FATHER NAME:",
+        ],
+    )
+
+    if value:
+        return value
+
+    for line in text_lines:
+        if "पिता" in line and ":" in line:
+            value = line.split(
+                ":",
+                1,
+            )[-1].strip()
+
+            value = re.sub(
+                r"[^\x00-\x7F]+",
+                "",
+                value,
+            ).strip()
+
+            if len(value) > 2:
+                return value.title()
+
+    return None
+
+
+def extract_gender_new(
+    text_lines: list[str],
+) -> str | None:
+    value = extract_inline_field(
+        text_lines,
+        ["GENDER:", "GENDER :"],
+    )
+
+    if value:
+        upper = value.upper()
+
+        if (
+            "MALE" in upper
+            or "PURUSH" in upper
+        ):
+            return "Male"
+
+        if (
+            "FEMALE" in upper
+            or "MAHILA" in upper
+        ):
+            return "Female"
+
+        return value
+
+    for line in text_lines:
+        if "लिंग" in line:
+            upper = line.upper()
+
+            if "MALE" in upper or "PURUSH" in upper:
+                return "Male"
+
+            if "FEMALE" in upper or "MAHILA" in upper:
+                return "Female"
+
+    return None
+
+
+def extract_dob_new(
+    text_lines: list[str],
+) -> str | None:
+    for line in text_lines:
+        upper = line.upper()
+
+        if (
+            "DATE OF BIRTH" in upper
+            or "AGE" in upper
+            or "जन्म" in line
+        ):
+            dob = find_date_anywhere(line)
+
+            if dob:
+                return dob
+
+            age_match = re.search(
+                r"\b(1[89]|[2-9]\d)\b",
+                line,
+            )
+
+            if age_match:
+                return f"Age: {age_match.group(0)}"
+
+    return None
+
+
+# ============================================================
+# OLD FORMAT EXTRACTION
+# ============================================================
+
+VOTER_HEADER_WORDS = [
+    "ELECTION",
+    "COMMISSION",
+    "VOTER",
+    "IDENTITY",
+    "CARD",
+    "INDIA",
+    "GOVT",
+    "GOVERNMENT",
+    "PHOTO",
+    "ELECTORS",
+    "PART",
+    "NUMBER",
+    "SERIAL",
+    "CONSTITUENCY",
+    "DISTRICT",
+    "STATE",
+    "SIGNATURE",
+    "BARCODE",
+    "ORIGINAL",
+]
+
+
+def is_a_name(
+    line: str,
+) -> bool:
+    line = line.strip()
+
+    if len(line) < 3 or len(line) > 45:
+        return False
+
+    if re.search(r"\d", line):
+        return False
+
+    if re.search(
+        r"[^A-Za-z\s\.\-]",
+        line,
+    ):
+        return False
+
+    words = re.findall(
+        r"[A-Za-z]+",
+        line.upper(),
+    )
+
+    if any(
+        word in VOTER_HEADER_WORDS
+        for word in words
+    ):
+        return False
+
+    real_words = [
+        word
+        for word in line.split()
+        if len(word) >= 2
+    ]
+
+    return len(real_words) >= 1
+
+
+def extract_label_value(
+    text_lines: list[str],
+    label_variants: list[str],
+) -> str | None:
+    for i, line in enumerate(text_lines):
+        upper = line.upper()
+
+        for label in label_variants:
+            if label not in upper:
+                continue
+
+            if ":" in line:
+                value = line.split(
+                    ":",
+                    1,
+                )[-1].strip()
+
+                value_clean = re.sub(
+                    r"[^\x00-\x7F]+",
+                    "",
+                    value,
+                ).strip()
+
+                if (
+                    value_clean
+                    and len(value_clean) > 1
+                ):
+                    return value_clean.title()
+
+            if i + 1 < len(text_lines):
+                next_line = text_lines[
+                    i + 1
+                ].strip()
+
+                next_clean = re.sub(
+                    r"[^\x00-\x7F]+",
+                    "",
+                    next_line,
+                ).strip()
+
+                if (
+                    next_clean
+                    and len(next_clean) > 1
+                    and is_a_name(next_clean)
+                ):
+                    return next_clean.title()
+
+    return None
+
+
+def extract_name_old(
+    text_lines: list[str],
+) -> str | None:
+    value = extract_label_value(
+        text_lines,
+        [
+            "नाम",
+            "NAM :",
+            "NAME :",
+            "NAME:",
+            "NAAM",
+        ],
+    )
+
+    if (
+        value
+        and "FATHER" not in value.upper()
+        and is_a_name(value)
+    ):
+        return value
+
+    header_done = False
+
+    for line in text_lines:
+        upper = line.upper()
+
+        if not header_done:
+            if (
+                "ELECTION COMMISSION" in upper
+                or "VOTER IDENTITY" in upper
+            ):
+                header_done = True
+
+            continue
+
+        clean = re.sub(
+            r"[^\x00-\x7F]+",
+            "",
+            line,
+        ).strip()
+
+        if (
+            clean
+            and is_a_name(clean)
+            and len(clean) > 3
+        ):
+            return clean.title()
+
+    return None
+
+
+def extract_father_old(
+    text_lines: list[str],
+) -> str | None:
+    value = extract_label_value(
+        text_lines,
+        [
+            "ORIGINAL NAME",
+            "RELATION NAME",
+            "पिता",
+            "पति",
+            "FATHER",
+        ],
+    )
+
+    if value and is_a_name(value):
+        return value
+
+    header_done = False
+    name_count = 0
+
+    for line in text_lines:
+        upper = line.upper()
+
+        if not header_done:
+            if (
+                "ELECTION COMMISSION" in upper
+                or "VOTER IDENTITY" in upper
+            ):
+                header_done = True
+
+            continue
+
+        clean = re.sub(
+            r"[^\x00-\x7F]+",
+            "",
+            line,
+        ).strip()
+
+        if (
+            clean
+            and is_a_name(clean)
+            and len(clean) > 3
+        ):
+            name_count += 1
+
+            if name_count == 2:
+                return clean.title()
+
+    return None
+
+
+def extract_voter_serial_old(
+    text_lines: list[str],
+) -> str | None:
+    full = " ".join(
+        text_lines
+    ).upper()
+
+    labels = [
+        "VOTER OF NUMBER",
+        "VOTER NUMBER",
+        "PART NO",
+        "PART NUMBER",
+        "SERIAL",
+    ]
+
+    for label in labels:
+        if label not in full:
+            continue
+
+        idx = full.index(label)
+
+        snippet = full[
+            idx + len(label):
+            idx + len(label) + 30
+        ]
+
+        numbers = re.findall(
+            r"[\d\-]+",
+            snippet,
+        )
+
+        if numbers:
+            return numbers[0].strip("-")
+
+    return None
+
+
+# ============================================================
+# EXTRACTION ENTRY POINT
+# ============================================================
+
+def extract_voter_data(
+    text_lines: list[str],
+    epic_number: str | None,
+) -> dict[str, Any]:
+    card_format = detect_voter_format(
+        text_lines
+    )
+
+    if card_format == "new":
+        name = extract_name_new(text_lines)
+        father_name = extract_father_new(text_lines)
+        gender = extract_gender_new(text_lines)
+        dob = extract_dob_new(text_lines)
+        voter_serial = None
+    else:
+        name = extract_name_old(text_lines)
+        father_name = extract_father_old(text_lines)
+        gender = None
+        dob = None
+        voter_serial = extract_voter_serial_old(
+            text_lines
+        )
+
+    return {
+        "format": card_format,
+        "epic": epic_number,
+        "name": name,
+        "father_name": father_name,
+        "gender": gender,
+        "dob": dob,
+        "voter_serial": voter_serial,
+    }
+
+
+def get_extraction_score(
+    extracted: dict[str, Any],
+) -> tuple[int, int]:
+    score = 0
+    card_format = extracted.get(
+        "format",
+        "old",
+    )
+
+    if extracted.get("epic"):
+        score += 20
+
+    if extracted.get("name"):
+        score += 20
+
+    if extracted.get("father_name"):
+        score += 15
+
+    if extracted.get("gender"):
+        score += 10
+
+    if extracted.get("dob"):
+        score += 10
+
+    if extracted.get("voter_serial"):
+        score += 5
+
+    # Extraction is evaluated against the fields applicable to the card.
+    # EPIC is not mandatory for an automatic extraction pass when OCR cannot
+    # read it reliably.
+    max_score = 80
+
+    return min(score, max_score), max_score
+
+
+# ============================================================
+# FINAL DECISION
+# ============================================================
+
+def make_final_decision(
+    quality_score: int,
+    quality_max: int,
+    detection_score: int,
+    extraction_score: int,
+    extraction_max: int,
+) -> tuple[int, str]:
+    """
+    Notebook weights:
+        Quality    = 40%
+        Detection  = 30%
+        Extraction = 30%
+    """
+    quality_norm = (
+        quality_score / quality_max
+    ) * 40 if quality_max > 0 else 0
+
+    detection_norm = (
+        detection_score / 100
+    ) * 30
+
+    extraction_norm = (
+        extraction_score / extraction_max
+    ) * 30 if extraction_max > 0 else 0
+
+    final_score = round(
+        quality_norm
+        + detection_norm
+        + extraction_norm
+    )
+
+    if final_score >= 80:
+        decision = "APPROVED"
+    elif final_score >= 55:
+        decision = "MANUAL REVIEW"
+    else:
+        decision = "REJECTED"
+
+    return final_score, decision
+
+
+# ============================================================
+# MAIN VERIFICATION FUNCTION
+# ============================================================
+
+def verify_voter_card(
+    file_bytes: bytes,
+) -> dict[str, Any]:
+    """
+    Run complete Voter ID verification.
+
+    Returns a structured result.
+    """
+    image = load_and_prepare_image(
+        file_bytes
+    )
+
+    quality_ok, quality_score, quality_max, problems = (
+        check_image_quality(image)
+    )
+
+    if not quality_ok:
+        return {
+            "decision": "REJECTED",
+            "final_score": 0,
+            "card_format": None,
+            "epic_number": None,
+            "name": None,
+            "father_name": None,
+            "gender": None,
+            "dob": None,
+            "voter_serial": None,
+            "quality": {
+                "score": quality_score,
+                "max_score": quality_max,
+                "problems": problems,
+            },
+            "detection_score": 0,
+            "extraction_score": 0,
+            "extraction_max": 0,
+        }
+
+    ocr_results = extract_text_from_image(
+        image
+    )
+
+    text_lines = get_lines(
+        ocr_results
+    )
+
+    if len(text_lines) < 3:
+        return {
+            "decision": "REJECTED",
+            "final_score": 0,
+            "card_format": None,
+            "epic_number": None,
+            "name": None,
+            "father_name": None,
+            "gender": None,
+            "dob": None,
+            "voter_serial": None,
+            "quality": {
+                "score": quality_score,
+                "max_score": quality_max,
+                "problems": [
+                    "OCR could not extract enough text."
+                ],
+            },
+            "detection_score": 0,
+            "extraction_score": 0,
+            "extraction_max": 0,
+        }
+
+    confirmed, epic_number, detection_score = (
+        is_voter_card(text_lines)
+    )
+
+    if not confirmed:
+        return {
+            "decision": "REJECTED",
+            "final_score": 0,
+            "card_format": None,
+            "epic_number": epic_number,
+            "name": None,
+            "father_name": None,
+            "gender": None,
+            "dob": None,
+            "voter_serial": None,
+            "quality": {
+                "score": quality_score,
+                "max_score": quality_max,
+                "problems": problems,
+            },
+            "detection_score": detection_score,
+            "extraction_score": 0,
+            "extraction_max": 0,
+        }
+
+    extracted = extract_voter_data(
+        text_lines,
+        epic_number,
+    )
+
+    extraction_score, extraction_max = (
+        get_extraction_score(extracted)
+    )
+
+    final_score, decision = make_final_decision(
+        quality_score,
+        quality_max,
+        detection_score,
+        extraction_score,
+        extraction_max,
+    )
+
+    return {
+        "decision": decision,
+        "final_score": final_score,
+        "card_format": extracted["format"],
+        "epic_number": extracted["epic"],
+        "name": extracted["name"],
+        "father_name": extracted["father_name"],
+        "gender": extracted["gender"],
+        "dob": extracted["dob"],
+        "voter_serial": extracted["voter_serial"],
+        "quality": {
+            "score": quality_score,
+            "max_score": quality_max,
+            "problems": problems,
+        },
+        "detection_score": detection_score,
+        "extraction_score": extraction_score,
+        "extraction_max": extraction_max,
+    }

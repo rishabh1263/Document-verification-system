@@ -1,0 +1,130 @@
+{
+    "request_id": "REQ-E8FAAFCF389B",
+    "original_filename": "Address_and_ID_proof_without_PAN.pdf",
+    "stored_filename": "b685bde8-3ae7-459a-a7e1-45fb0ede7f9b.pdf",
+    "file_type": ".pdf",
+    "validation_mode": "PHASE_1_NO_OCR",
+    "verification_result": {
+        "request_id": "REQ-E8FAAFCF389B",
+        "document_type": "PASSPORT",
+        "status": "DOCUMENT_REJECTED",
+        "decision": "DOCUMENT_REJECTED",
+        "score": 40.0,
+        "confidence": 0.4,
+        "validation_mode": "PHASE_1_NO_OCR",
+        "validation": {
+            "document": {
+                "document_type": "PASSPORT",
+                "eligible": true,
+                "confidence": 0.5,
+                "classification_method": "NON_OCR_STRUCTURAL",
+                "checks": {
+                    "file_exists": true,
+                    "supported_extension": true,
+                    "pdf_readable": true,
+                    "has_pages": true,
+                    "within_page_limit": true
+                },
+                "metadata": {
+                    "extension": ".pdf",
+                    "page_count": 2
+                },
+                "warnings": [
+                    "Passport identity cannot be confirmed without OCR/MRZ extraction."
+                ]
+            },
+            "quality": {
+                "passed": false,
+                "available": false,
+                "score": 0.0,
+                "confidence": 0.0,
+                "reason": "Image quality analysis failed: 'str' object has no attribute 'size'",
+                "checks": {}
+            },
+            "preprocessing": {
+                "is_pdf": true,
+                "page_count": 2,
+                "image_count": 1,
+                "quality_passed": false
+            },
+            "common": {
+                "decision": "DOCUMENT_REJECT",
+                "score": 40.0,
+                "verification_stage": "LOCAL_DOCUMENT_AUTHENTICITY",
+                "checks": {
+                    "document_type_detected": true,
+                    "required_fields_present": 0,
+                    "required_fields_total": 0,
+                    "required_fields_score": 0.0,
+                    "field_format_valid": true,
+                    "ocr_confidence": 0.0,
+                    "ocr_quality_score": 0.0,
+                    "field_consistency_score": 0.0,
+                    "text_coherence_score": 0.0,
+                    "layout_score": 100.0,
+                    "quality_score": 0.0,
+                    "quality_metrics": {},
+                    "tamper_score": 0.0,
+                    "tamper_risk": "LOW",
+                    "extraction_successful": false
+                },
+                "reasons": [
+                    "No required-field definition was supplied.",
+                    "Required document extraction did not complete reliably.",
+                    "Local validation score (40.00) is below the review threshold."
+                ],
+                "warnings": [
+                    "OCR confidence is low (0.00).",
+                    "Extracted fields show weak internal consistency.",
+                    "OCR text has weak coherence.",
+                    "Document image/file quality is below the preferred threshold."
+                ],
+                "authoritative_verification": {
+                    "status": "NOT_PERFORMED",
+                    "message": "Local validation does not prove official validity. Authoritative verification must be performed separately."
+                },
+                "optional": {
+                    "document_type": "PASSPORT",
+                    "validation_mode": "PHASE_1_NO_OCR",
+                    "ocr_performed": false,
+                    "mrz_performed": false,
+                    "extraction_performed": false,
+                    "preprocessing_available": true
+                }
+            }
+        },
+        "los": {
+            "document_validation": "DOCUMENT_REJECTED",
+            "requires_ocr_phase": true,
+            "requires_rcu_review": false,
+            "credit_decision": null
+        },
+        "errors": [
+            "No required-field definition was supplied.",
+            "Required document extraction did not complete reliably.",
+            "Local validation score (40.00) is below the review threshold."
+        ],
+        "warnings": [
+            "OCR confidence is low (0.00).",
+            "Extracted fields show weak internal consistency.",
+            "OCR text has weak coherence.",
+            "Document image/file quality is below the preferred threshold.",
+            "Phase 1 is non-OCR validation. Passport identity, MRZ and extracted-field verification are deferred to Phase 2.",
+            "Phase 1 performs non-OCR passport validation only. Passport identity, MRZ fields and MRZ checksum validation are deferred to Phase 2."
+        ],
+        "security": {},
+        "structural_checks": {
+            "file_exists": true,
+            "supported_extension": true,
+            "pdf_readable": true,
+            "has_pages": true,
+            "within_page_limit": true
+        },
+        "structural_passed": true,
+        "page_count": 2,
+        "page_check": true,
+        "quality_score": 0.0,
+        "processing_time_seconds": 0.362
+    },
+    "created_at": "2026-08-20T05:10:53.982947"
+}

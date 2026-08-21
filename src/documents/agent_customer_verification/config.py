@@ -1,0 +1,4 @@
+﻿SIMILARITY_THRESHOLD = 0.55
+
+AGENT_EMBEDDING = "agent.npy"
+CUSTOMER_EMBEDDING = "customer.npy"

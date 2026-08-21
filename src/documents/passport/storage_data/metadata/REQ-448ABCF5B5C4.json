@@ -1,0 +1,97 @@
+{
+    "request_id": "REQ-448ABCF5B5C4",
+    "original_filename": "Address_and_ID_proof_without_PAN.pdf",
+    "stored_filename": "10608164-352e-402a-91a2-f40e439f52d2.pdf",
+    "file_type": ".pdf",
+    "validation_mode": "PHASE_1_NO_OCR",
+    "verification_result": {
+        "request_id": "REQ-448ABCF5B5C4",
+        "document_type": "PASSPORT",
+        "status": "DOCUMENT_VERIFIED",
+        "decision": "DOCUMENT_VERIFIED",
+        "score": 100.0,
+        "confidence": 1.0,
+        "validation_mode": "PHASE_1_NO_OCR",
+        "validation": {
+            "document": {
+                "document_type": "PASSPORT",
+                "eligible": true,
+                "confidence": 0.5,
+                "classification_method": "NON_OCR_STRUCTURAL",
+                "checks": {
+                    "file_exists": true,
+                    "supported_extension": true,
+                    "pdf_readable": true,
+                    "has_pages": true,
+                    "within_page_limit": true
+                },
+                "metadata": {
+                    "extension": ".pdf",
+                    "page_count": 2
+                },
+                "warnings": [
+                    "Passport identity cannot be confirmed without OCR/MRZ extraction."
+                ]
+            },
+            "quality": {
+                "available": true,
+                "passed": true,
+                "score": 100.0,
+                "confidence": 1.0,
+                "reason": "Passport image quality is sufficient.",
+                "checks": {
+                    "resolution": true,
+                    "passport_resolution": true,
+                    "quality_score": true,
+                    "aspect_ratio": true
+                },
+                "metrics": {
+                    "available": true,
+                    "resolution": "1275x805",
+                    "width": 1275,
+                    "height": 805,
+                    "blur_score": 556.06,
+                    "brightness": 239.93,
+                    "contrast": 44.47,
+                    "aspect_ratio": 1.584,
+                    "resolution_ok": true,
+                    "aspect_ratio_ok": true
+                },
+                "score_details": {
+                    "available": true,
+                    "blur_score": 556.06,
+                    "brightness": 239.93,
+                    "contrast": 44.47,
+                    "width": 1275,
+                    "height": 805,
+                    "aspect_ratio": 1.584,
+                    "blur_score_component": 100.0,
+                    "brightness_component": 100.0,
+                    "contrast_component": 100.0,
+                    "resolution_ok": true,
+                    "aspect_ratio_ok": true
+                }
+            },
+            "preprocessing": {
+                "is_pdf": true,
+                "page_count": 2,
+                "image_count": 1,
+                "quality_passed": true
+            },
+            "common": null
+        },
+        "los": {
+            "document_validation": "DOCUMENT_VERIFIED",
+            "requires_ocr_phase": true,
+            "requires_rcu_review": false,
+            "credit_decision": null
+        },
+        "errors": [],
+        "warnings": [
+            "Phase 1 performs non-OCR passport validation only.",
+            "OCR/MRZ identity verification is deferred to Phase 2.",
+            "Phase 1 performs non-OCR passport validation only. Passport identity, MRZ fields and MRZ checksum validation are deferred to Phase 2."
+        ]
+    },
+    "created_at": "2026-08-20T05:30:32.939646"
+}
