@@ -102,16 +102,6 @@ class PanValidation(BaseModel):
         description="Whether a face was detected in the expected photo region."
     )
 
-    pan_identity: bool = Field(
-        default=False,
-        description="Whether strict PAN-specific visual identity checks passed."
-    )
-
-    security_feature: bool = Field(
-        default=False,
-        description="Whether a PAN-specific security/QR feature was detected."
-    )
-
 
 class PanValidationResponse(BaseModel):
     """
@@ -234,14 +224,11 @@ def _clean_decision(result: dict[str, Any]) -> str:
         )
     )
 
-    # The validator may expose the PAN-specific security evidence as
-    # security_feature, security_block, or qr_right depending on the
-    # validation implementation/version. These are equivalent evidence
-    # sources for the router's final authoritative gate.
     security_feature = bool(
-        validation.get("security_feature", False)
-        or validation.get("security_block", False)
-        or validation.get("qr_right", False)
+        validation.get(
+            "security_feature",
+            False,
+        )
     )
 
     # --------------------------------------------------------------
@@ -335,15 +322,16 @@ def _pan_input_geometry_ok(
     content_type: str | None,
 ) -> bool:
     """
-    Fast PAN geometry gate.
+    Fast PAN input gate.
 
-    Strongly portrait uploads such as bank passbooks and biodata pages
-    are rejected before the PAN validator runs.
+    IMPORTANT: do not measure the whole camera frame only. A user may upload
+    a phone photograph where the PAN card occupies only part of a 4:3/16:9
+    frame. In that case the full-frame ratio can be > 1.90 even though the
+    card itself has the correct PAN-card geometry.
 
-    Supported PAN ratio:
-        1.30 <= width / height <= 1.90
+    This remains only a defense-in-depth gate. The authoritative PAN
+    validator performs the actual PAN-specific visual/security checks.
     """
-
     if not file_bytes:
         return False
 
@@ -354,48 +342,74 @@ def _pan_input_geometry_ok(
     )
 
     try:
-        if (
-            normalized == "application/pdf"
-            or file_bytes[:4] == b"%PDF"
-        ):
+        if normalized == "application/pdf" or file_bytes[:4] == b"%PDF":
             document = pymupdf.open(
                 stream=file_bytes,
                 filetype="pdf",
             )
-
             try:
-                if document.page_count == 0:
-                    return False
-
-                page = document.load_page(0)
-                width = float(page.rect.width)
-                height = float(page.rect.height)
-
+                # Do not reject scanned PDFs just because the PDF page is A4
+                # or portrait. The PAN validator handles the rendered page.
+                return document.page_count > 0
             finally:
                 document.close()
 
-        else:
-            arr = np.frombuffer(
-                file_bytes,
-                dtype=np.uint8,
-            )
-
-            image = cv2.imdecode(
-                arr,
-                cv2.IMREAD_GRAYSCALE,
-            )
-
-            if image is None:
-                return False
-
-            height, width = image.shape[:2]
-
-        if width <= 0 or height <= 0:
+        arr = np.frombuffer(file_bytes, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
             return False
 
-        ratio = width / height
+        h, w = image.shape[:2]
+        if w <= 0 or h <= 0:
+            return False
 
-        return 1.30 <= ratio <= 1.90
+        full_ratio = w / h
+        if 1.30 <= full_ratio <= 1.90:
+            return True
+
+        # Phone-photo fallback: detect a large light/low-saturation card
+        # against the surrounding scene. This is deliberately lightweight and
+        # runs on a downscaled image.
+        scale = min(1.0, 1100.0 / max(w, h))
+        work = image if scale >= 1.0 else cv2.resize(
+            image,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        wh, ww = work.shape[:2]
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            np.array([0, 0, 45], dtype=np.uint8),
+            np.array([179, 115, 255], dtype=np.uint8),
+        )
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8)
+        )
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8)
+        )
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        frame_area = float(ww * wh)
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < frame_area * 0.08:
+                continue
+
+            _, _, bw, bh = cv2.boundingRect(contour)
+            if bw < 160 or bh < 90:
+                continue
+
+            ratio = bw / max(float(bh), 1.0)
+            if 1.30 <= ratio <= 1.90:
+                return True
+
+        return False
 
     except Exception:
         return False
@@ -650,19 +664,8 @@ async def verify_pan(
         "pan_identity": bool(
             validation.get("pan_identity", False)
         ),
-        # Recompute this inside the endpoint scope for diagnostics.
-        # security_feature is local to _clean_decision(), so referencing
-        # that local variable here causes NameError.
         "security_feature": bool(
             validation.get("security_feature", False)
-            or validation.get("security_block", False)
-            or validation.get("qr_right", False)
-        ),
-        "security_block": bool(
-            validation.get("security_block", False)
-        ),
-        "qr_right": bool(
-            validation.get("qr_right", False)
         ),
     }
 

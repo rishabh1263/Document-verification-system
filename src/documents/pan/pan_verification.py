@@ -3224,74 +3224,57 @@ def _fast_pan_face_detect(
     image: np.ndarray,
 ) -> bool:
     """
-    FAST face-presence gate for PAN validation.
+    Fast PAN face gate.
 
-    Uses OpenCV Haar detection only. Each PAN photo ROI is bounded to a
-    small working image so detection stays fast on CPU.
+    Uses Haar face detection only; the old eye-confirmation step caused
+    false negatives on genuine scanned/compressed PAN photos.
     """
     if image is None or image.size == 0:
         return False
 
     h, w = image.shape[:2]
-    if h < 80 or w < 100:
-        return False
-
-    try:
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        if face_cascade.empty():
-            return False
-    except Exception:
+    face_cascade = _get_pan_face_cascade()
+    if face_cascade is None:
         return False
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Both common PAN photo layouts.
-    for xa, xb in ((0.00, 0.46), (0.54, 1.00)):
+    # PAN photos are normally on the left for older cards and on the right
+    # for newer layouts. Check the likely side first based on edge variance,
+    # then only check the other side if needed.
+    regions = (
+        (0.00, 0.46),
+        (0.54, 1.00),
+    )
+
+    for xa, xb in regions:
         roi = gray[
-            int(h * 0.16):int(h * 0.96),
+            int(h * 0.12):int(h * 0.98),
             int(w * xa):int(w * xb),
         ]
-
         if roi.size == 0:
             continue
 
-        # Bound the detector workload.
-        if roi.shape[1] > 500:
-            scale = 500.0 / roi.shape[1]
+        if roi.shape[1] < 220:
             roi = cv2.resize(
-                roi,
-                (
-                    500,
-                    max(1, int(roi.shape[0] * scale)),
-                ),
-                interpolation=cv2.INTER_AREA,
+                roi, None, fx=2.0, fy=2.0,
+                interpolation=cv2.INTER_CUBIC,
             )
 
         faces = face_cascade.detectMultiScale(
             roi,
             scaleFactor=1.10,
-            minNeighbors=7,
+            minNeighbors=6,
             minSize=(
-                max(24, int(roi.shape[1] * 0.055)),
-                max(24, int(roi.shape[0] * 0.055)),
+                max(18, int(roi.shape[1] * 0.055)),
+                max(18, int(roi.shape[0] * 0.055)),
             ),
             flags=cv2.CASCADE_SCALE_IMAGE,
         )
 
-        for fx, fy, fw, fh in faces:
-            face_fraction = fh / max(float(roi.shape[0]), 1.0)
-
-            if not (0.08 <= face_fraction <= 0.72):
-                continue
-
-            # The Haar face detector is the authoritative face-presence
-            # signal here. The old eye-confirmation step rejected genuine
-            # scanned/blurred PAN photos even when a strong face detection
-            # existed. PAN-specific QR/security gating still prevents
-            # generic documents from becoming verified PANs.
-            return True
+        for _, _, _, fh in faces:
+            if 0.07 <= fh / max(float(roi.shape[0]), 1.0) <= 0.72:
+                return True
 
     return False
 
@@ -3299,17 +3282,10 @@ def _fast_pan_security_feature(
     image: np.ndarray,
 ) -> dict[str, Any]:
     """
-    Fast PAN-specific security/hologram detector.
+    Fast PAN-specific security detector.
 
-    Supports:
-      - QR-enabled PANs
-      - older PAN cards with a hologram/security patch
-      - scanned/compressed cards where QR decoding fails
-
-    The fallback is intentionally location-aware: the candidate must be a
-    compact, information-dense, approximately square patch in the expected
-    upper-right PAN security zone. This is materially different from generic
-    text/stamp detection used by passbooks.
+    QR is searched only in the expected right-side region. If QR detection
+    fails, the compact right-side security/hologram detector is used.
     """
     empty = {
         "qr_detected": False,
@@ -3327,218 +3303,240 @@ def _fast_pan_security_feature(
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # QR is only expected on the right half of the PAN. Limiting the
+    # detector to this region substantially reduces CPU work.
+    x1 = int(w * 0.50)
+    y1 = int(h * 0.00)
+    y2 = int(h * 0.88)
+    qr_roi = gray[y1:y2, x1:w]
+
+    qr_right = False
+    qr_detected = False
+
+    if qr_roi.size:
+        try:
+            detector = cv2.QRCodeDetector()
+
+            for scale in (1.0, 1.5):
+                test = (
+                    qr_roi
+                    if scale == 1.0
+                    else cv2.resize(
+                        qr_roi,
+                        None,
+                        fx=scale,
+                        fy=scale,
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                )
+
+                try:
+                    _, points, _ = detector.detectAndDecode(test)
+                except Exception:
+                    points = None
+
+                if points is None:
+                    try:
+                        detected = detector.detect(test)
+                        points = (
+                            detected[1]
+                            if isinstance(detected, tuple)
+                            and len(detected) == 2
+                            and detected[0]
+                            else None
+                        )
+                    except Exception:
+                        points = None
+
+                if points is not None:
+                    pts = np.asarray(points).reshape(-1, 2)
+                    if pts.size >= 8:
+                        cx = float(np.mean(pts[:, 0]) / scale) + x1
+                        cy = float(np.mean(pts[:, 1]) / scale)
+
+                        if cx >= w * 0.55 and cy <= h * 0.88:
+                            qr_detected = True
+                            qr_right = True
+                            break
+        except Exception:
+            pass
+
+    if qr_right:
+        return {
+            "qr_detected": True,
+            "qr_right": True,
+            "security_block": True,
+            "security_block_score": 1.0,
+        }
+
     # --------------------------------------------------------------
-    # 1. QR detection. Fast first pass, then targeted 2x right-side ROI.
+    # 2. BROADER RIGHT-SIDE SECURITY REGION
     # --------------------------------------------------------------
-    try:
-        detector = cv2.QRCodeDetector()
 
-        ok, points = detector.detect(gray)
-        if ok and points is not None:
-            pts = np.asarray(points).reshape(-1, 2)
-            if pts.size >= 8:
-                cx = float(np.mean(pts[:, 0]))
-                cy = float(np.mean(pts[:, 1]))
-                if cx >= w * 0.55 and cy <= h * 0.90:
-                    return {
-                        "qr_detected": True,
-                        "qr_right": True,
-                        "security_block": True,
-                        "security_block_score": 1.0,
-                    }
+    x1 = int(w * 0.55)
+    x2 = int(w * 0.99)
+    y1 = int(h * 0.05)
+    y2 = int(h * 0.90)
 
-        qx1, qx2 = int(w * 0.50), int(w * 0.995)
-        qy1, qy2 = int(h * 0.01), int(h * 0.90)
-        qr_roi = gray[qy1:qy2, qx1:qx2]
+    roi = gray[y1:y2, x1:x2]
 
-        if qr_roi.size:
-            qr_test = cv2.resize(
-                qr_roi, None, fx=2.0, fy=2.0,
-                interpolation=cv2.INTER_CUBIC,
-            )
-            ok, points = detector.detect(qr_test)
-            if ok and points is not None:
-                pts = np.asarray(points).reshape(-1, 2)
-                if pts.size >= 8:
-                    pts[:, 0] = pts[:, 0] / 2.0 + qx1
-                    pts[:, 1] = pts[:, 1] / 2.0 + qy1
-                    cx = float(np.mean(pts[:, 0]))
-                    cy = float(np.mean(pts[:, 1]))
-                    if cx >= w * 0.50 and cy <= h * 0.90:
-                        return {
-                            "qr_detected": True,
-                            "qr_right": True,
-                            "security_block": True,
-                            "security_block_score": 1.0,
-                        }
-    except Exception:
-        pass
-
-    # --------------------------------------------------------------
-    # 2. Older PAN hologram/security patch.
-    #
-    # Do not search the whole card. Restrict to the upper-right area.
-    # This prevents central passbook stamps from qualifying.
-    # --------------------------------------------------------------
-    zx1 = int(w * 0.58)
-    zx2 = int(w * 0.98)
-    zy1 = int(h * 0.04)
-    zy2 = int(h * 0.72)
-
-    zone = gray[zy1:zy2, zx1:zx2]
-    if zone.size == 0:
+    if roi.size == 0:
         return empty
 
-    zh, zw = zone.shape[:2]
+    roi_norm = cv2.normalize(
+        roi,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX,
+    )
 
-    # Bound CPU cost.
-    if zw > 700:
-        scale = 700.0 / zw
-        zone = cv2.resize(
-            zone,
-            (700, max(1, int(zh * scale))),
+    roi_blur = cv2.GaussianBlur(
+        roi_norm,
+        (3, 3),
+        0,
+    )
+
+    edges = cv2.Canny(
+        roi_blur,
+        50,
+        150,
+    )
+
+    contours, _ = cv2.findContours(
+        edges,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    best_score = 0.0
+    best_candidate = False
+
+    roi_h, roi_w = roi.shape[:2]
+
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.035 * perimeter,
+            True,
+        )
+
+        if not (4 <= len(approx) <= 8):
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(contour)
+
+        if bw <= 0 or bh <= 0:
+            continue
+
+        width_fraction = bw / max(float(roi_w), 1.0)
+        height_fraction = bh / max(float(roi_h), 1.0)
+        aspect = bw / max(float(bh), 1.0)
+        area_fraction = (bw * bh) / max(float(roi_w * roi_h), 1.0)
+
+        # Compact structure only.
+        if width_fraction < 0.08 or width_fraction > 0.70:
+            continue
+
+        if height_fraction < 0.08 or height_fraction > 0.70:
+            continue
+
+        if area_fraction < 0.012 or area_fraction > 0.35:
+            continue
+
+        if not (0.45 <= aspect <= 2.20):
+            continue
+
+        block = roi[by:by + bh, bx:bx + bw]
+
+        if block.size == 0:
+            continue
+
+        block_std = float(np.std(block))
+
+        block_edges = cv2.Canny(
+            block,
+            50,
+            150,
+        )
+
+        edge_density = (
+            float(np.count_nonzero(block_edges))
+            / max(float(block.size), 1.0)
+        )
+
+        if block_std < 12.0:
+            continue
+
+        if edge_density < 0.025:
+            continue
+
+        small = cv2.resize(
+            block,
+            (64, 64),
             interpolation=cv2.INTER_AREA,
         )
-        zh, zw = zone.shape[:2]
 
-    # Candidate contours from two edge scales.
-    best_score = 0.0
-
-    for low, high in ((45, 130), (70, 180)):
-        edges = cv2.Canny(zone, low, high)
-        contours, _ = cv2.findContours(
-            edges,
-            cv2.RETR_LIST,
-            cv2.CHAIN_APPROX_SIMPLE,
+        local_edges = cv2.Canny(
+            small,
+            40,
+            120,
         )
 
-        for contour in contours:
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter <= 0:
-                continue
+        local_density = (
+            float(np.count_nonzero(local_edges))
+            / max(float(local_edges.size), 1.0)
+        )
 
-            approx = cv2.approxPolyDP(
-                contour,
-                0.045 * perimeter,
-                True,
-            )
-            if not (4 <= len(approx) <= 8):
-                continue
+        if local_density < 0.04:
+            continue
 
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            if bw < 12 or bh < 12:
-                continue
+        aspect_distance = min(
+            abs(np.log(max(aspect, 0.01))),
+            1.5,
+        )
 
-            wf = bw / max(float(zw), 1.0)
-            hf = bh / max(float(zh), 1.0)
-            aspect = bw / max(float(bh), 1.0)
-            area = (bw * bh) / max(float(zw * zh), 1.0)
+        aspect_score = max(
+            0.0,
+            1.0 - aspect_distance / 1.5,
+        )
 
-            # Security patch is compact and approximately square.
-            if not (0.07 <= wf <= 0.55):
-                continue
-            if not (0.07 <= hf <= 0.70):
-                continue
-            if not (0.008 <= area <= 0.22):
-                continue
-            if not (0.45 <= aspect <= 1.80):
-                continue
+        texture_score = min(
+            1.0,
+            edge_density / 0.16,
+        )
 
-            block = zone[by:by + bh, bx:bx + bw]
-            if block.size == 0:
-                continue
+        local_texture_score = min(
+            1.0,
+            local_density / 0.18,
+        )
 
-            std = float(np.std(block))
-            if std < 14.0:
-                continue
+        contrast_score = min(
+            1.0,
+            block_std / 55.0,
+        )
 
-            block_edges = cv2.Canny(block, 45, 150)
-            edge_density = (
-                float(np.count_nonzero(block_edges))
-                / max(float(block.size), 1.0)
-            )
-            if edge_density < 0.025:
-                continue
+        score = (
+            aspect_score * 0.20
+            + texture_score * 0.30
+            + local_texture_score * 0.35
+            + contrast_score * 0.15
+        )
 
-            small = cv2.resize(
-                block, (48, 48),
-                interpolation=cv2.INTER_AREA,
-            )
-            local_edges = cv2.Canny(small, 40, 120)
-            local_density = (
-                float(np.count_nonzero(local_edges))
-                / max(float(local_edges.size), 1.0)
-            )
-            if local_density < 0.035:
-                continue
-
-            aspect_score = max(
-                0.0,
-                1.0 - min(abs(np.log(max(aspect, 0.01))), 1.5) / 1.5,
-            )
-            texture_score = min(1.0, edge_density / 0.16)
-            local_score = min(1.0, local_density / 0.18)
-            contrast_score = min(1.0, std / 55.0)
-
-            score = (
-                aspect_score * 0.25
-                + texture_score * 0.25
-                + local_score * 0.35
-                + contrast_score * 0.15
-            )
-
-            if score > best_score:
-                best_score = score
-
-    # --------------------------------------------------------------
-    # 3. Grid fallback for heavily scanned cards.
-    #
-    # It looks for a square-ish high-information patch, but only inside
-    # the upper-right PAN zone. No OCR and no whole-image scan.
-    # --------------------------------------------------------------
-    if best_score < 0.42:
-        zone_blur = cv2.GaussianBlur(zone, (3, 3), 0)
-
-        # Candidate patch sizes around the typical hologram/security block.
-        patch_fracs = (0.16, 0.20, 0.24, 0.28)
-
-        for frac in patch_fracs:
-            ph = max(16, int(zh * frac))
-            pw = ph
-
-            if ph >= zh or pw >= zw:
-                continue
-
-            step_y = max(8, ph // 2)
-            step_x = max(8, pw // 2)
-
-            for y in range(0, zh - ph + 1, step_y):
-                for x in range(0, zw - pw + 1, step_x):
-                    patch = zone_blur[y:y + ph, x:x + pw]
-                    std = float(np.std(patch))
-                    if std < 22.0:
-                        continue
-
-                    ed = cv2.Canny(patch, 50, 150)
-                    density = (
-                        float(np.count_nonzero(ed))
-                        / max(float(ed.size), 1.0)
-                    )
-                    if density < 0.07:
-                        continue
-
-                    # Strong information density + square geometry.
-                    score = min(1.0, std / 70.0) * 0.45 + \
-                            min(1.0, density / 0.22) * 0.55
-
-                    if score > best_score:
-                        best_score = score
+        if score > best_score:
+            best_score = score
+            best_candidate = score >= 0.42
 
     return {
-        "qr_detected": False,
-        "qr_right": False,
-        "security_block": bool(best_score >= 0.42),
-        "security_block_score": round(float(best_score), 4),
+        "qr_detected": qr_detected,
+        "qr_right": qr_right,
+        "security_block": bool(best_candidate),
+        "security_block_score": round(best_score, 4),
     }
 
 def _strict_pan_visual_identity(
@@ -3652,6 +3650,92 @@ def _fast_local_tamper(image: np.ndarray) -> dict[str, Any]:
         return {"tamper_score":70.0,"risk":"MEDIUM","decision":"DOCUMENT_REJECTED","signals":["EXCESSIVE_EDGE_ARTIFACTS"],"checks":{"edge_density":density},"available":True}
     return {"tamper_score":0.0,"risk":"LOW","decision":"PASS","signals":[],"checks":{"edge_density":round(density,4)},"available":True}
 
+def _detect_pan_card_crop(image: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Detect a PAN/card-shaped object inside a larger phone photo."""
+    if image is None or image.size == 0:
+        return image, False
+
+    h, w = image.shape[:2]
+    full_ratio = w / max(h, 1)
+    if MIN_PAN_ASPECT_RATIO <= full_ratio <= MAX_PAN_ASPECT_RATIO:
+        return image, False
+
+    scale = min(1.0, 1100.0 / max(w, h))
+    work = image if scale >= 1.0 else cv2.resize(
+        image,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    wh, ww = work.shape[:2]
+    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 45], dtype=np.uint8),
+        np.array([179, 115, 255], dtype=np.uint8),
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8)
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8)
+    )
+
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    frame_area = float(ww * wh)
+    best = None
+    best_score = 0.0
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < frame_area * 0.08:
+            continue
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bw < 160 or bh < 90:
+            continue
+        ratio = bw / max(float(bh), 1.0)
+        if not (1.15 <= ratio <= 2.10):
+            continue
+
+        area_fraction = area / frame_area
+        ratio_score = max(
+            0.0, 1.0 - min(abs(ratio - 1.55) / 0.75, 1.0)
+        )
+        area_score = min(1.0, area_fraction / 0.35)
+        score = ratio_score * 0.60 + area_score * 0.40
+
+        if score > best_score:
+            best_score = score
+            best = (x, y, bw, bh, ratio)
+
+    if best is None:
+        return image, False
+
+    x, y, bw, bh, ratio = best
+    if not (MIN_PAN_ASPECT_RATIO <= ratio <= MAX_PAN_ASPECT_RATIO):
+        return image, False
+
+    pad_x = max(2, int(bw * 0.015))
+    pad_y = max(2, int(bh * 0.015))
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(ww, x + bw + pad_x)
+    y2 = min(wh, y + bh + pad_y)
+
+    crop = work[y1:y2, x1:x2]
+    if crop.size == 0:
+        return image, False
+
+    crop_h, crop_w = crop.shape[:2]
+    crop_ratio = crop_w / max(crop_h, 1)
+    if not (MIN_PAN_ASPECT_RATIO <= crop_ratio <= MAX_PAN_ASPECT_RATIO):
+        return image, False
+
+    return crop, True
+
+
 def _fast_pan_validation(
     image: np.ndarray,
 ) -> dict[str, Any]:
@@ -3666,21 +3750,7 @@ def _fast_pan_validation(
         raise PanVerificationError("Invalid or empty image.")
 
     image = _prepare_image(image)
-
-    # Speed optimization: validation does not need OCR-resolution images.
-    # Keep enough detail for face/security detection while reducing CPU work.
-    max_validation_width = 1200
-    if image.shape[1] > max_validation_width:
-        scale = max_validation_width / float(image.shape[1])
-        image = cv2.resize(
-            image,
-            (
-                max_validation_width,
-                max(1, int(image.shape[0] * scale)),
-            ),
-            interpolation=cv2.INTER_AREA,
-        )
-
+    image, auto_cropped = _detect_pan_card_crop(image)
     quality = _fast_local_quality(image)
 
     # Tamper is deliberately delayed until PAN identity is established.
@@ -3845,6 +3915,7 @@ def _fast_pan_validation(
         "score": score,
         "validation": {
             "document_detected": bool(document_detected),
+            "auto_cropped": bool(auto_cropped),
             "image_quality": (
                 "GOOD"
                 if image_quality_score >= 80
@@ -3860,8 +3931,7 @@ def _fast_pan_validation(
                 pan_identity["pan_identity"]
             ),
             "security_feature": bool(
-                pan_identity["qr_detected"]
-                or pan_identity["security_block"]
+                pan_identity.get("security_feature", False)
             ),
         },
         "processing_time_seconds": round(elapsed, 3),
@@ -4191,7 +4261,13 @@ def verify_pan_card(
             "Make sure the uploaded file is a valid image."
         )
 
+    # IMPORTANT: assign the validator result before any debug access.
     result = _fast_pan_validation(image)
+
+    print("========== VERIFY_PAN_CARD FINAL RESULT ==========")
+    print("verified:", result.get("verified") if isinstance(result, dict) else None)
+    print("validation:", result.get("validation") if isinstance(result, dict) else None)
+    print("===================================================")
 
     return result
 
@@ -4771,4 +4847,5 @@ print("========== PAN VERIFICATION DEBUG LOADED ==========")
 print("PAN VERIFICATION FILE:", __file__)
 print("PAN CLASSIFIER VERSION:", PAN_CLASSIFIER_VERSION)
 print("===================================================")
+
 
