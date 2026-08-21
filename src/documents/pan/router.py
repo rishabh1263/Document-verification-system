@@ -102,6 +102,16 @@ class PanValidation(BaseModel):
         description="Whether a face was detected in the expected photo region."
     )
 
+    pan_identity: bool = Field(
+        default=False,
+        description="Whether strict PAN-specific visual identity checks passed."
+    )
+
+    security_feature: bool = Field(
+        default=False,
+        description="Whether a PAN-specific security/QR feature was detected."
+    )
+
 
 class PanValidationResponse(BaseModel):
     """
@@ -224,11 +234,14 @@ def _clean_decision(result: dict[str, Any]) -> str:
         )
     )
 
+    # The validator may expose the PAN-specific security evidence as
+    # security_feature, security_block, or qr_right depending on the
+    # validation implementation/version. These are equivalent evidence
+    # sources for the router's final authoritative gate.
     security_feature = bool(
-        validation.get(
-            "security_feature",
-            False,
-        )
+        validation.get("security_feature", False)
+        or validation.get("security_block", False)
+        or validation.get("qr_right", False)
     )
 
     # --------------------------------------------------------------
@@ -637,8 +650,19 @@ async def verify_pan(
         "pan_identity": bool(
             validation.get("pan_identity", False)
         ),
+        # Recompute this inside the endpoint scope for diagnostics.
+        # security_feature is local to _clean_decision(), so referencing
+        # that local variable here causes NameError.
         "security_feature": bool(
             validation.get("security_feature", False)
+            or validation.get("security_block", False)
+            or validation.get("qr_right", False)
+        ),
+        "security_block": bool(
+            validation.get("security_block", False)
+        ),
+        "qr_right": bool(
+            validation.get("qr_right", False)
         ),
     }
 
@@ -748,5 +772,4 @@ print(
     ),
 )
 print("============================================")
-
 
