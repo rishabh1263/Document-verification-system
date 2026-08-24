@@ -3150,142 +3150,507 @@ def _get_pan_face_cascade():
     return _PAN_FACE_CASCADE
 
 
-_PAN_EYE_CASCADE = None
-
-
-def _get_pan_eye_cascade():
-    """Lazy-load the lightweight eye cascade used to confirm a face hit."""
-    global _PAN_EYE_CASCADE
-
-    if _PAN_EYE_CASCADE is None:
-        cascade_path = (
-            cv2.data.haarcascades
-            + "haarcascade_eye.xml"
-        )
-
-        cascade = cv2.CascadeClassifier(cascade_path)
-
-        if cascade.empty():
-            return None
-
-        _PAN_EYE_CASCADE = cascade
-
-    return _PAN_EYE_CASCADE
-
-
-def _face_has_eye(
-    gray_roi: np.ndarray,
-    face_box: tuple[int, int, int, int],
-) -> bool:
-    """
-    Confirm a Haar face hit using an eye detector.
-
-    This prevents document stamps/seals from being accepted as faces.
-    """
-
-    eye_cascade = _get_pan_eye_cascade()
-
-    if eye_cascade is None:
-        return False
-
-    x, y, w, h = face_box
-
-    if w <= 0 or h <= 0:
-        return False
-
-    face = gray_roi[
-        max(0, y):min(gray_roi.shape[0], y + h),
-        max(0, x):min(gray_roi.shape[1], x + w),
-    ]
-
-    if face.size == 0:
-        return False
-
-    upper = face[
-        :max(1, int(face.shape[0] * 0.68)),
-        :
-    ]
-
-    eyes = eye_cascade.detectMultiScale(
-        upper,
-        scaleFactor=1.12,
-        minNeighbors=4,
-        minSize=(
-            max(4, int(face.shape[1] * 0.08)),
-            max(4, int(face.shape[0] * 0.08)),
-        ),
-        flags=cv2.CASCADE_SCALE_IMAGE,
-    )
-
-    return len(eyes) >= 1
-
-
 def _fast_pan_face_detect(
     image: np.ndarray,
 ) -> bool:
     """
-    Fast PAN face gate.
+    Fast PAN photo-face check.
 
-    Uses Haar face detection only; the old eye-confirmation step caused
-    false negatives on genuine scanned/compressed PAN photos.
+    No OCR and no extraction.
+
+    The previous implementation cropped too tightly from x=70% onward.
+    That cut off the left side of the photograph on camera-captured PANs.
+    This version checks the two plausible PAN photo zones at low resolution:
+        - right-side photo zone
+        - left-side photo zone
+
+    The input to Haar is capped at 320 px wide, so this remains CPU-cheap.
     """
+
     if image is None or image.size == 0:
         return False
 
-    h, w = image.shape[:2]
-    face_cascade = _get_pan_face_cascade()
-    if face_cascade is None:
+    cascade = _get_pan_face_cascade()
+
+    if cascade is None:
         return False
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    height, width = image.shape[:2]
 
-    # PAN photos are normally on the left for older cards and on the right
-    # for newer layouts. Check the likely side first based on edge variance,
-    # then only check the other side if needed.
-    regions = (
-        (0.00, 0.46),
-        (0.54, 1.00),
+    # PAN layouts commonly place the portrait on either side depending
+    # on the card generation/layout. Check both without scanning the
+    # entire photograph at full resolution.
+    zones = (
+        (0.52, 0.22, 0.99, 0.98),  # right-side portrait
+        (0.01, 0.18, 0.48, 0.82),  # left-side portrait
     )
 
-    for xa, xb in regions:
-        roi = gray[
-            int(h * 0.12):int(h * 0.98),
-            int(w * xa):int(w * xb),
-        ]
+    for x1f, y1f, x2f, y2f in zones:
+
+        x1 = max(0, int(width * x1f))
+        y1 = max(0, int(height * y1f))
+        x2 = min(width, int(width * x2f))
+        y2 = min(height, int(height * y2f))
+
+        roi = image[y1:y2, x1:x2]
+
         if roi.size == 0:
             continue
 
-        if roi.shape[1] < 220:
-            roi = cv2.resize(
-                roi, None, fx=2.0, fy=2.0,
-                interpolation=cv2.INTER_CUBIC,
-            )
-
-        faces = face_cascade.detectMultiScale(
+        gray = cv2.cvtColor(
             roi,
-            scaleFactor=1.10,
-            minNeighbors=6,
-            minSize=(
-                max(18, int(roi.shape[1] * 0.055)),
-                max(18, int(roi.shape[0] * 0.055)),
-            ),
-            flags=cv2.CASCADE_SCALE_IMAGE,
+            cv2.COLOR_BGR2GRAY,
         )
 
-        for _, _, _, fh in faces:
-            if 0.07 <= fh / max(float(roi.shape[0]), 1.0) <= 0.72:
+        # Keep detector input small.
+        if gray.shape[1] > 320:
+            scale = 320.0 / float(gray.shape[1])
+            gray = cv2.resize(
+                gray,
+                (
+                    320,
+                    max(
+                        1,
+                        int(gray.shape[0] * scale),
+                    ),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        gray = cv2.equalizeHist(gray)
+
+        try:
+            faces = cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.10,
+                minNeighbors=3,
+                minSize=(20, 20),
+                flags=cv2.CASCADE_SCALE_IMAGE,
+            )
+        except Exception:
+            continue
+
+        if len(faces) == 0:
+            continue
+
+        # Reject extremely tiny detections.
+        roi_area = float(
+            gray.shape[0] * gray.shape[1]
+        )
+
+        for _, _, fw, fh in faces:
+            face_area = float(fw * fh)
+
+            if (
+                face_area / max(roi_area, 1.0)
+                >= 0.010
+            ):
                 return True
 
     return False
+
+
+# ============================================================================
+# FAST VALIDATION-ONLY PATH (OCR / EXTRACTION DISABLED)
+# ============================================================================
+#
+# This path intentionally performs NO OCR and NO field extraction.
+# It validates the visual PAN-card structure, image quality, geometry,
+# tamper evidence and the presence of the expected PAN visual regions.
+#
+# IMPORTANT:
+# - This is LOCAL DOCUMENT VALIDATION only.
+# - It does NOT prove that a PAN exists in a government database.
+# - Extraction code remains below for future use but is NOT called by the
+#   public validation path.
+# ============================================================================
+
+def _fast_pan_visual_regions(
+    image: np.ndarray,
+) -> tuple[int, int, bool]:
+    """
+    Detect broad PAN-card visual regions using inexpensive OpenCV operations.
+
+    Returns:
+        present_count, total_expected, photo_present
+    """
+    height, width = image.shape[:2]
+
+    if width <= 0 or height <= 0:
+        return 0, 5, False
+
+    # Normalize only for analysis; do not run OCR.
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # PAN cards normally have a wide rectangular layout.
+    ratio = width / max(height, 1)
+
+    # Broad geometry gate. Photographs/scans may be cropped, so keep this
+    # deliberately tolerant.
+    geometry_ok = 1.25 <= ratio <= 2.05
+
+    # Edge map is inexpensive and gives a useful signal that the image has
+    # structured card content rather than being an empty/flat image.
+    edges = cv2.Canny(gray, 60, 160)
+    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
+
+    # Horizontal/vertical structure provides a cheap layout signal.
+    horizontal = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    vertical = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+    structure_score = (
+        min(1.0, float(np.mean(np.abs(horizontal))) / 35.0)
+        + min(1.0, float(np.mean(np.abs(vertical))) / 35.0)
+    ) / 2.0
+
+    # Expected broad regions:
+    # 1. government/header area
+    # 2. holder-name area
+    # 3. father's-name area
+    # 4. DOB/PAN information area
+    # 5. photo/signature side
+    #
+    # We use ROI variance/edge activity instead of OCR text.
+    regions = [
+        (0.04, 0.05, 0.96, 0.24),
+        (0.10, 0.25, 0.72, 0.48),
+        (0.10, 0.40, 0.72, 0.62),
+        (0.10, 0.55, 0.90, 0.92),
+        (0.72, 0.18, 0.98, 0.78),
+    ]
+
+    present = 0
+
+    for x1, y1, x2, y2 in regions:
+        xa = max(0, int(width * x1))
+        ya = max(0, int(height * y1))
+        xb = min(width, int(width * x2))
+        yb = min(height, int(height * y2))
+
+        roi = gray[ya:yb, xa:xb]
+
+        if roi.size == 0:
+            continue
+
+        roi_std = float(np.std(roi))
+        roi_edges = cv2.Canny(roi, 50, 150)
+        roi_edge_density = (
+            float(np.count_nonzero(roi_edges)) / float(roi_edges.size)
+            if roi_edges.size
+            else 0.0
+        )
+
+        if roi_std >= 10.0 or roi_edge_density >= 0.015:
+            present += 1
+
+    # Photo presence is a visual signal only. Detect a compact textured
+    # rectangular region on the right side; no face model is loaded here,
+    # keeping the endpoint fast.
+    photo_x1 = int(width * 0.68)
+    photo_y1 = int(height * 0.18)
+    photo_x2 = int(width * 0.98)
+    photo_y2 = int(height * 0.78)
+
+    photo_roi = gray[photo_y1:photo_y2, photo_x1:photo_x2]
+
+    photo_present = False
+    if photo_roi.size:
+        photo_std = float(np.std(photo_roi))
+        photo_edges = cv2.Canny(photo_roi, 50, 150)
+        photo_edge_density = (
+            float(np.count_nonzero(photo_edges)) / float(photo_edges.size)
+        )
+
+        # Avoid requiring a face detector. The purpose here is to detect
+        # whether the expected photo region contains meaningful visual data.
+        photo_present = (
+            photo_std >= 12.0
+            and photo_edge_density >= 0.01
+        )
+
+    # If the image has strong card geometry/structure, tolerate one weak ROI.
+    if geometry_ok and structure_score >= 0.12 and edge_density >= 0.01:
+        present = max(present, 4)
+
+    return present, 5, photo_present
+
+
+def _fast_crop_pan_card(
+    image: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """
+    Locate a PAN-shaped card inside a larger camera photograph.
+
+    One bounded contour pass. No OCR.
+    """
+    if image is None or image.size == 0:
+        return image, False
+
+    h, w = image.shape[:2]
+    full_ratio = w / max(float(h), 1.0)
+
+    if MIN_PAN_ASPECT_RATIO <= full_ratio <= MAX_PAN_ASPECT_RATIO:
+        return image, False
+
+    scale = min(1.0, 900.0 / max(float(w), 1.0))
+    work = image
+    if scale < 1.0:
+        work = cv2.resize(
+            image,
+            (
+                max(1, int(w * scale)),
+                max(1, int(h * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(
+        cv2.GaussianBlur(gray, (5, 5), 0),
+        50,
+        140,
+    )
+
+    contours, _ = cv2.findContours(
+        edges,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    wh = work.shape[0]
+    ww = work.shape[1]
+    image_area = float(wh * ww)
+    best = None
+    best_score = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.08:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.025 * perimeter,
+            True,
+        )
+        if not 4 <= len(approx) <= 8:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(contour)
+        if cw < ww * 0.25 or ch < wh * 0.20:
+            continue
+
+        ratio = cw / max(float(ch), 1.0)
+        if not (
+            MIN_PAN_ASPECT_RATIO * 0.82
+            <= ratio
+            <= MAX_PAN_ASPECT_RATIO * 1.18
+        ):
+            continue
+
+        fill = area / max(float(cw * ch), 1.0)
+        if fill < 0.45:
+            continue
+
+        ratio_score = max(
+            0.0,
+            1.0 - min(abs(ratio - 1.58) / 1.58, 1.0),
+        )
+        area_score = min(
+            1.0,
+            area / max(image_area * 0.60, 1.0),
+        )
+
+        score = (
+            ratio_score * 0.55
+            + fill * 0.25
+            + area_score * 0.20
+        )
+
+        if score > best_score:
+            best_score = score
+            best = (x, y, cw, ch)
+
+    if best is None or best_score < 0.45:
+        return image, False
+
+    x, y, cw, ch = best
+    inv = 1.0 / max(scale, 1e-6)
+
+    x1 = max(0, int(x * inv))
+    y1 = max(0, int(y * inv))
+    x2 = min(w, int((x + cw) * inv))
+    y2 = min(h, int((y + ch) * inv))
+
+    mx = int((x2 - x1) * 0.025)
+    my = int((y2 - y1) * 0.025)
+
+    x1 = max(0, x1 - mx)
+    y1 = max(0, y1 - my)
+    x2 = min(w, x2 + mx)
+    y2 = min(h, y2 + my)
+
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return image, False
+
+    crop_ratio = crop.shape[1] / max(float(crop.shape[0]), 1.0)
+
+    if not (
+        MIN_PAN_ASPECT_RATIO * 0.85
+        <= crop_ratio
+        <= MAX_PAN_ASPECT_RATIO * 1.15
+    ):
+        return image, False
+
+    return crop, True
+
+
+def _fast_pan_layout_identity(
+    image: np.ndarray,
+    *,
+    visual_present: int,
+    photo_present: bool,
+    security_feature: bool,
+) -> bool:
+    """
+    Final cheap PAN visual-layout gate.
+
+    The detailed edge-row heuristic used here previously was redundant:
+    visual_regions + photo + face + security are already evaluated by the
+    authoritative validator.  Keeping another texture heuristic created
+    false negatives on photographed/scanned PAN cards.
+
+    No OCR and no extraction.
+    """
+    return bool(
+        image is not None
+        and image.size > 0
+        and visual_present >= 4
+        and photo_present
+        and security_feature
+    )
+
+
+
+# ============================================================================
+# FAST LOCAL QUALITY / SECURITY / TAMPER HELPERS
+# ============================================================================
+# These helpers are intentionally lightweight. The public verification path
+# below is validation-only: it does not run OCR or field extraction.
+# ============================================================================
+
+def _fast_local_quality(
+    image: np.ndarray,
+) -> dict[str, Any]:
+    """Calculate a bounded, CPU-cheap image-quality score."""
+    if image is None or image.size == 0:
+        return {
+            "image_quality": "BAD",
+            "score": 0.0,
+            "blur_score": 0.0,
+            "contrast": 0.0,
+            "brightness": 0.0,
+        }
+
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        return {
+            "image_quality": "BAD",
+            "score": 0.0,
+            "blur_score": 0.0,
+            "contrast": 0.0,
+            "brightness": 0.0,
+        }
+
+    # Bound CPU work for very large phone photos.
+    work = image
+    if w > 900:
+        scale = 900.0 / float(w)
+        work = cv2.resize(
+            image,
+            (
+                900,
+                max(1, int(h * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    gray = cv2.cvtColor(
+        work,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    blur_score = float(
+        cv2.Laplacian(
+            gray,
+            cv2.CV_64F,
+        ).var()
+    )
+
+    # Brightness: strongest around a normal mid-range exposure.
+    brightness_component = max(
+        0.0,
+        100.0 - abs(brightness - 140.0) * 0.55,
+    )
+
+    # Contrast and sharpness are capped so one metric cannot dominate.
+    contrast_component = min(
+        100.0,
+        contrast * 2.2,
+    )
+
+    sharpness_component = min(
+        100.0,
+        blur_score / 2.0,
+    )
+
+    score = round(
+        brightness_component * 0.35
+        + contrast_component * 0.35
+        + sharpness_component * 0.15
+        + 15.0,
+        2,
+    )
+
+    score = max(
+        0.0,
+        min(100.0, score),
+    )
+
+    if score >= 70.0:
+        quality = "GOOD"
+    elif score >= 45.0:
+        quality = "FAIR"
+    else:
+        quality = "POOR"
+
+    return {
+        "image_quality": quality,
+        "score": score,
+        "blur_score": round(blur_score, 2),
+        "contrast": round(contrast, 2),
+        "brightness": round(brightness, 2),
+    }
+
 
 def _fast_pan_security_feature(
     image: np.ndarray,
 ) -> dict[str, Any]:
     """
-    Fast PAN-specific security detector.
+    Detect PAN-specific right-side security evidence without OCR.
 
-    QR is searched only in the expected right-side region. If QR detection
-    fails, the compact right-side security/hologram detector is used.
+    Signals:
+      1. QR detection at multiple scales.
+      2. Compact textured rectangular structure in the right-side PAN area.
+
+    This is a local visual signal, not proof of government authenticity.
     """
     empty = {
         "qr_detected": False,
@@ -3301,65 +3666,75 @@ def _fast_pan_security_feature(
     if h < 80 or w < 100:
         return empty
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY,
+    )
 
-    # QR is only expected on the right half of the PAN. Limiting the
-    # detector to this region substantially reduces CPU work.
-    x1 = int(w * 0.50)
-    y1 = int(h * 0.00)
-    y2 = int(h * 0.88)
-    qr_roi = gray[y1:y2, x1:w]
-
-    qr_right = False
+    # --------------------------------------------------------------
+    # 1. MULTI-SCALE QR DETECTION
+    # --------------------------------------------------------------
     qr_detected = False
+    qr_right = False
 
-    if qr_roi.size:
-        try:
-            detector = cv2.QRCodeDetector()
+    try:
+        detector = cv2.QRCodeDetector()
 
-            for scale in (1.0, 1.5):
-                test = (
-                    qr_roi
-                    if scale == 1.0
-                    else cv2.resize(
-                        qr_roi,
-                        None,
-                        fx=scale,
-                        fy=scale,
-                        interpolation=cv2.INTER_CUBIC,
-                    )
+        for scale in (1.0, 1.5, 2.0):
+            if scale == 1.0:
+                test = gray
+            else:
+                test = cv2.resize(
+                    gray,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=cv2.INTER_CUBIC,
                 )
 
-                try:
-                    _, points, _ = detector.detectAndDecode(test)
-                except Exception:
-                    points = None
-
-                if points is None:
-                    try:
-                        detected = detector.detect(test)
-                        points = (
-                            detected[1]
-                            if isinstance(detected, tuple)
-                            and len(detected) == 2
-                            and detected[0]
-                            else None
-                        )
-                    except Exception:
-                        points = None
+            try:
+                decoded, points, _ = detector.detectAndDecode(test)
 
                 if points is not None:
                     pts = np.asarray(points).reshape(-1, 2)
                     if pts.size >= 8:
-                        cx = float(np.mean(pts[:, 0]) / scale) + x1
+                        cx = float(np.mean(pts[:, 0]) / scale)
                         cy = float(np.mean(pts[:, 1]) / scale)
 
-                        if cx >= w * 0.55 and cy <= h * 0.88:
+                        if (
+                            cx >= w * 0.55
+                            and cy <= h * 0.85
+                        ):
                             qr_detected = True
                             qr_right = True
                             break
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+            try:
+                detected = detector.detect(test)
+
+                if isinstance(detected, tuple):
+                    ok, points = detected
+
+                    if ok and points is not None:
+                        pts = np.asarray(points).reshape(-1, 2)
+                        if pts.size >= 8:
+                            cx = float(np.mean(pts[:, 0]) / scale)
+                            cy = float(np.mean(pts[:, 1]) / scale)
+
+                            if (
+                                cx >= w * 0.55
+                                and cy <= h * 0.85
+                            ):
+                                qr_detected = True
+                                qr_right = True
+                                break
+            except Exception:
+                pass
+
+    except Exception:
+        pass
 
     if qr_right:
         return {
@@ -3372,7 +3747,6 @@ def _fast_pan_security_feature(
     # --------------------------------------------------------------
     # 2. BROADER RIGHT-SIDE SECURITY REGION
     # --------------------------------------------------------------
-
     x1 = int(w * 0.55)
     x2 = int(w * 0.99)
     y1 = int(h * 0.05)
@@ -3411,11 +3785,13 @@ def _fast_pan_security_feature(
 
     best_score = 0.0
     best_candidate = False
-
     roi_h, roi_w = roi.shape[:2]
 
     for contour in contours:
-        perimeter = cv2.arcLength(contour, True)
+        perimeter = cv2.arcLength(
+            contour,
+            True,
+        )
 
         if perimeter <= 0:
             continue
@@ -3426,38 +3802,55 @@ def _fast_pan_security_feature(
             True,
         )
 
-        if not (4 <= len(approx) <= 8):
+        if not 4 <= len(approx) <= 8:
             continue
 
-        bx, by, bw, bh = cv2.boundingRect(contour)
+        bx, by, bw, bh = cv2.boundingRect(
+            contour,
+        )
 
         if bw <= 0 or bh <= 0:
             continue
 
-        width_fraction = bw / max(float(roi_w), 1.0)
-        height_fraction = bh / max(float(roi_h), 1.0)
-        aspect = bw / max(float(bh), 1.0)
-        area_fraction = (bw * bh) / max(float(roi_w * roi_h), 1.0)
+        width_fraction = bw / max(
+            float(roi_w),
+            1.0,
+        )
+        height_fraction = bh / max(
+            float(roi_h),
+            1.0,
+        )
+        aspect = bw / max(
+            float(bh),
+            1.0,
+        )
+        area_fraction = (
+            bw * bh
+        ) / max(
+            float(roi_w * roi_h),
+            1.0,
+        )
 
-        # Compact structure only.
         if width_fraction < 0.08 or width_fraction > 0.70:
             continue
-
         if height_fraction < 0.08 or height_fraction > 0.70:
             continue
-
         if area_fraction < 0.012 or area_fraction > 0.35:
             continue
-
-        if not (0.45 <= aspect <= 2.20):
+        if not 0.45 <= aspect <= 2.20:
             continue
 
-        block = roi[by:by + bh, bx:bx + bw]
+        block = roi[
+            by:by + bh,
+            bx:bx + bw,
+        ]
 
         if block.size == 0:
             continue
 
-        block_std = float(np.std(block))
+        block_std = float(
+            np.std(block)
+        )
 
         block_edges = cv2.Canny(
             block,
@@ -3470,10 +3863,7 @@ def _fast_pan_security_feature(
             / max(float(block.size), 1.0)
         )
 
-        if block_std < 12.0:
-            continue
-
-        if edge_density < 0.025:
+        if block_std < 12.0 or edge_density < 0.025:
             continue
 
         small = cv2.resize(
@@ -3536,422 +3926,270 @@ def _fast_pan_security_feature(
         "qr_detected": qr_detected,
         "qr_right": qr_right,
         "security_block": bool(best_candidate),
-        "security_block_score": round(best_score, 4),
+        "security_block_score": round(
+            best_score,
+            4,
+        ),
     }
 
-def _strict_pan_visual_identity(
+
+def _fast_local_tamper(
     image: np.ndarray,
-    *,
-    geometry_ok: bool,
-    visual_present: int,
-    photo_present: bool,
-    face_detected: bool,
 ) -> dict[str, Any]:
     """
-    AUTHORITATIVE visual PAN identity gate.
+    Very lightweight artifact-risk check.
 
-    This is deliberately much stricter than the old generic ROI score.
-
-    A document is PAN-like only when ALL of the following hold:
-
-        - PAN-card geometry
-        - enough PAN visual regions
-        - a photograph region exists
-        - a real face is detected
-        - a PAN-specific right-side security/QR feature exists
-
-    This prevents generic biodata, passbooks, statements and random
-    documents containing a person's face from becoming PAN documents.
+    This is a fraud-risk signal only; it is not forensic proof of forgery.
     """
-
-    security = _fast_pan_security_feature(
-        image
-    )
-
-    pan_identity = bool(
-        geometry_ok
-        and visual_present >= 4
-        and photo_present
-        and face_detected
-        and bool(
-            security["qr_right"]
-            or security["security_block"]
-        )
-    )
-
-    return {
-        "pan_identity": pan_identity,
-        "qr_detected": security["qr_detected"],
-        "qr_right": security["qr_right"],
-        "security_block": security["security_block"],
-        "security_feature": bool(
-            security["qr_right"]
-            or security["security_block"]
-        ),
-        "security_block_score": security[
-            "security_block_score"
-        ],
-    }
-
-
-# ============================================================================
-# FAST VALIDATION-ONLY PATH (OCR / EXTRACTION DISABLED)
-# ============================================================================
-#
-# This path intentionally performs NO OCR or field extraction. PAN identity is established using strict visual/security signals.
-# It validates the visual PAN-card structure, image quality, geometry,
-# tamper evidence and the presence of the expected PAN visual regions.
-#
-# IMPORTANT:
-# - This is LOCAL DOCUMENT VALIDATION only.
-# - It does NOT prove that a PAN exists in a government database.
-# - Extraction code remains below for future use but is NOT called by the
-#   public validation path.
-# ============================================================================
-
-def _fast_pan_visual_regions(image: np.ndarray) -> tuple[int, int, bool]:
-    """Fast PAN layout check supporting both photo layouts."""
-    h,w=image.shape[:2]
-    if h<=0 or w<=0: return 0,5,False
-    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-    regions=[(0.03,0.04,0.97,0.24),(0.05,0.22,0.68,0.46),(0.05,0.38,0.68,0.62),(0.05,0.52,0.70,0.91),(0.68,0.10,0.98,0.90)]
-    present=0
-    for x1,y1,x2,y2 in regions:
-        roi=gray[int(h*y1):int(h*y2),int(w*x1):int(w*x2)]
-        if roi.size and (float(np.std(roi))>=9.0 or float(np.count_nonzero(cv2.Canny(roi,70,150)))/roi.size>=0.012): present+=1
-    photo_present=False
-    for x1,x2 in ((0.02,0.44),(0.56,0.98)):
-        roi=gray[int(h*0.18):int(h*0.94),int(w*x1):int(w*x2)]
-        if roi.size and float(np.std(roi))>=12.0: photo_present=True; break
-    return present,5,photo_present
-
-def _fast_local_quality(image: np.ndarray) -> dict[str, Any]:
-    """CPU-cheap quality metrics; no OCR/model inference."""
-    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-    mean=float(np.mean(gray)); std=float(np.std(gray))
-    lap=float(cv2.Laplacian(gray,cv2.CV_64F).var())
-    brightness=max(0.0,100.0-abs(mean-140.0)*0.55)
-    contrast=min(100.0,std*2.2)
-    sharp=min(100.0,lap/2.0)
-    score=round(brightness*0.35+contrast*0.35+sharp*0.15+100.0*0.15,2)
-    return {"quality_score":score,"brightness":round(mean,2),"contrast":round(std,2),"sharpness":round(lap,2)}
-
-def _fast_local_tamper(image: np.ndarray) -> dict[str, Any]:
-    """Very lightweight artifact-risk check for the <1s validation path.
-
-    This is deliberately a risk signal, not forensic proof.
-    """
-    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-    edges=cv2.Canny(gray,70,160)
-    density=float(np.count_nonzero(edges))/max(float(edges.size),1.0)
-    # Extreme global edge density is suspicious/noisy; normal card photos are
-    # kept LOW. Do not punish blur here because blur is handled by quality.
-    if density>0.35:
-        return {"tamper_score":70.0,"risk":"MEDIUM","decision":"DOCUMENT_REJECTED","signals":["EXCESSIVE_EDGE_ARTIFACTS"],"checks":{"edge_density":density},"available":True}
-    return {"tamper_score":0.0,"risk":"LOW","decision":"PASS","signals":[],"checks":{"edge_density":round(density,4)},"available":True}
-
-def _detect_pan_card_crop(image: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Detect a PAN/card-shaped object inside a larger phone photo."""
     if image is None or image.size == 0:
-        return image, False
+        return {
+            "tamper_score": 100.0,
+            "risk": "HIGH",
+            "decision": "DOCUMENT_REJECTED",
+            "signals": ["INVALID_IMAGE"],
+            "checks": {},
+            "available": True,
+        }
 
     h, w = image.shape[:2]
-    full_ratio = w / max(h, 1)
-    if MIN_PAN_ASPECT_RATIO <= full_ratio <= MAX_PAN_ASPECT_RATIO:
-        return image, False
+    work = image
 
-    scale = min(1.0, 1100.0 / max(w, h))
-    work = image if scale >= 1.0 else cv2.resize(
-        image,
-        (max(1, int(w * scale)), max(1, int(h * scale))),
-        interpolation=cv2.INTER_AREA,
-    )
-
-    wh, ww = work.shape[:2]
-    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(
-        hsv,
-        np.array([0, 0, 45], dtype=np.uint8),
-        np.array([179, 115, 255], dtype=np.uint8),
-    )
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8)
-    )
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8)
-    )
-
-    contours, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    frame_area = float(ww * wh)
-    best = None
-    best_score = 0.0
-
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < frame_area * 0.08:
-            continue
-        x, y, bw, bh = cv2.boundingRect(contour)
-        if bw < 160 or bh < 90:
-            continue
-        ratio = bw / max(float(bh), 1.0)
-        if not (1.15 <= ratio <= 2.10):
-            continue
-
-        area_fraction = area / frame_area
-        ratio_score = max(
-            0.0, 1.0 - min(abs(ratio - 1.55) / 0.75, 1.0)
+    if w > 800:
+        scale = 800.0 / float(w)
+        work = cv2.resize(
+            image,
+            (
+                800,
+                max(1, int(h * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
         )
-        area_score = min(1.0, area_fraction / 0.35)
-        score = ratio_score * 0.60 + area_score * 0.40
 
-        if score > best_score:
-            best_score = score
-            best = (x, y, bw, bh, ratio)
+    gray = cv2.cvtColor(
+        work,
+        cv2.COLOR_BGR2GRAY,
+    )
 
-    if best is None:
-        return image, False
+    edges = cv2.Canny(
+        gray,
+        70,
+        160,
+    )
 
-    x, y, bw, bh, ratio = best
-    if not (MIN_PAN_ASPECT_RATIO <= ratio <= MAX_PAN_ASPECT_RATIO):
-        return image, False
+    density = (
+        float(np.count_nonzero(edges))
+        / max(float(edges.size), 1.0)
+    )
 
-    pad_x = max(2, int(bw * 0.015))
-    pad_y = max(2, int(bh * 0.015))
-    x1 = max(0, x - pad_x)
-    y1 = max(0, y - pad_y)
-    x2 = min(ww, x + bw + pad_x)
-    y2 = min(wh, y + bh + pad_y)
+    if density > 0.35:
+        return {
+            "tamper_score": 70.0,
+            "risk": "MEDIUM",
+            "decision": "DOCUMENT_REJECTED",
+            "signals": ["EXCESSIVE_EDGE_ARTIFACTS"],
+            "checks": {
+                "edge_density": round(density, 4),
+            },
+            "available": True,
+        }
 
-    crop = work[y1:y2, x1:x2]
-    if crop.size == 0:
-        return image, False
-
-    crop_h, crop_w = crop.shape[:2]
-    crop_ratio = crop_w / max(crop_h, 1)
-    if not (MIN_PAN_ASPECT_RATIO <= crop_ratio <= MAX_PAN_ASPECT_RATIO):
-        return image, False
-
-    return crop, True
+    return {
+        "tamper_score": 0.0,
+        "risk": "LOW",
+        "decision": "PASS",
+        "signals": [],
+        "checks": {
+            "edge_density": round(density, 4),
+        },
+        "available": True,
+    }
 
 
 def _fast_pan_validation(
     image: np.ndarray,
 ) -> dict[str, Any]:
     """
-    Fast PAN validation without OCR or extraction.
+    VERIFICATION-ONLY FAST PATH.
 
-    Target: normally < 1 second on a normal local CPU image.
+    No OCR and no field extraction.
+
+    Authoritative local PAN-document gates:
+      1. PAN geometry / card crop
+      2. PAN visual-region structure
+      3. photograph region
+      4. face in photograph region
+      5. PAN-specific security/QR evidence
+      6. conservative image quality
+      7. low tamper risk
+
+    This does NOT verify PAN existence with a government database.
     """
-    start = datetime.now()
+    started = datetime.now()
 
     if image is None or image.size == 0:
-        raise PanVerificationError("Invalid or empty image.")
+        raise PanVerificationError("Invalid image.")
 
     image = _prepare_image(image)
-    image, auto_cropped = _detect_pan_card_crop(image)
-    quality = _fast_local_quality(image)
 
-    # Tamper is deliberately delayed until PAN identity is established.
-    tamper_result = {"tamper_score":0,"risk":"LOW","decision":"NOT_PERFORMED","signals":[],"checks":{},"available":False}
+    image, auto_cropped = _fast_crop_pan_card(image)
 
-    try:
-        width = int(image.shape[1])
-        height = int(image.shape[0])
-        aspect_ratio = width / max(height, 1)
-    except Exception:
-        width = 0
-        height = 0
-        aspect_ratio = 0.0
-
-    # Use the common image-quality result where available.
-    quality_metrics = dict(quality or {})
-    quality_metrics["tamper"] = tamper_result
-
-    image_quality_score = 0.0
-    if quality_metrics:
-        try:
-            image_quality_score = float(
-                quality_metrics.get("quality_score", 0.0)
-            )
-        except (TypeError, ValueError):
-            image_quality_score = 0.0
-
-    if image_quality_score <= 0:
-        # Fallback lightweight quality score.
-        brightness = float(np.mean(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)))
-        contrast = float(np.std(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)))
-
-        brightness_score = (
-            100.0
-            if 55.0 <= brightness <= 225.0
-            else max(0.0, 100.0 - abs(brightness - 140.0) * 0.7)
-        )
-        contrast_score = min(100.0, max(0.0, contrast * 2.0))
-        geometry_score = (
-            100.0
-            if MIN_PAN_ASPECT_RATIO <= aspect_ratio <= MAX_PAN_ASPECT_RATIO
-            else 50.0
+    # Bound all downstream CPU work.  The validator does not need the
+    # original multi-megapixel resolution for geometry, face, QR, quality,
+    # or tamper checks. Keep aspect ratio intact.
+    max_width = 1200
+    if image.shape[1] > max_width:
+        scale = max_width / float(image.shape[1])
+        image = cv2.resize(
+            image,
+            (
+                max_width,
+                max(1, int(image.shape[0] * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
         )
 
-        image_quality_score = round(
-            brightness_score * 0.35
-            + contrast_score * 0.35
-            + geometry_score * 0.30,
-            2,
-        )
-
-    visual_present, visual_total, photo_present = _fast_pan_visual_regions(
-        image
-    )
+    height, width = image.shape[:2]
+    ratio = width / max(float(height), 1.0)
 
     geometry_ok = (
         MIN_PAN_ASPECT_RATIO
-        <= aspect_ratio
+        <= ratio
         <= MAX_PAN_ASPECT_RATIO
     )
 
-    # Face detection supports BOTH common PAN photograph layouts.
-    face_detected = (
-        _fast_pan_face_detect(image)
-        if geometry_ok
-        else False
+    quality_result = _fast_local_quality(image)
+    image_quality = str(
+        quality_result.get("image_quality", "UNKNOWN")
+    ).upper()
+    image_quality_score = float(
+        quality_result.get("score", 0.0)
     )
 
-    # --------------------------------------------------------------
-    # STRICT PAN IDENTITY
-    # --------------------------------------------------------------
-    #
-    # Generic visual-region scoring is NOT enough.
-    # A biodata/passbook/random document may contain:
-    #   - text regions
-    #   - a face
-    #   - a wide aspect ratio
-    #
-    # Therefore the final document classifier also requires a
-    # PAN-specific security/QR feature on the right side.
-    # --------------------------------------------------------------
-
-    pan_identity = _strict_pan_visual_identity(
-        image,
-        geometry_ok=geometry_ok,
-        visual_present=visual_present,
-        photo_present=photo_present,
-        face_detected=face_detected,
+    visual_present, visual_total, photo_present = (
+        _fast_pan_visual_regions(image)
     )
 
-    if pan_identity["pan_identity"]:
-        tamper_result = _fast_local_tamper(image)
+    face_detected = _fast_pan_face_detect(image)
 
-    visual_field_ratio = f"{visual_present}/{visual_total}"
-
-    document_detected = bool(
-        pan_identity["pan_identity"]
-        and image_quality_score >= 35.0
+    security = _fast_pan_security_feature(image)
+    security_feature = bool(
+        security.get("qr_right")
+        or security.get("security_block")
     )
 
-    # Tamper risk is handled conservatively.
+    tamper_result = _fast_local_tamper(image)
     tamper_risk = str(
         tamper_result.get("risk", "UNKNOWN")
     ).upper()
 
-    if tamper_risk in {
-        "HIGH",
-        "MEDIUM",
-    }:
+    pan_identity = bool(
+        geometry_ok
+        and visual_present >= 4
+        and photo_present
+        and face_detected
+        and security_feature
+        and _fast_pan_layout_identity(
+            image,
+            visual_present=visual_present,
+            photo_present=photo_present,
+            security_feature=security_feature,
+        )
+    )
+
+    document_detected = bool(
+        pan_identity
+        and image_quality_score >= 35.0
+    )
+
+    if not geometry_ok:
         decision = "DOCUMENT_REJECTED"
-    elif tamper_risk in {
-        "UNKNOWN",
-        "MANUAL_REVIEW",
-    }:
-        decision = "MANUAL_REVIEW"
+    elif not pan_identity:
+        decision = "DOCUMENT_REJECTED"
     elif not document_detected:
-        decision = "DOCUMENT_REJECTED"
-    elif not pan_identity["pan_identity"]:
         decision = "DOCUMENT_REJECTED"
     elif not face_detected:
         decision = "DOCUMENT_REJECTED"
     elif image_quality_score < 35.0:
         decision = "DOCUMENT_REJECTED"
+    elif tamper_risk in {"HIGH", "MEDIUM"}:
+        decision = "DOCUMENT_REJECTED"
+    elif tamper_risk in {"UNKNOWN", "MANUAL_REVIEW"}:
+        decision = "MANUAL_REVIEW"
     else:
         decision = "DOCUMENT_VERIFIED_SUCCESSFULLY"
 
-    # Score is intentionally based only on validation signals.
-    quality_component = min(100.0, max(0.0, image_quality_score))
+    quality_component = min(
+        100.0,
+        max(0.0, image_quality_score),
+    )
     visual_component = (
         visual_present / visual_total * 100.0
         if visual_total
         else 0.0
     )
     geometry_component = 100.0 if geometry_ok else 0.0
-
-    try:
-        tamper_score = float(tamper_result.get("tamper_score", 0.0))
-    except (TypeError, ValueError):
-        tamper_score = 0.0
-
-    tamper_component = max(0.0, min(100.0, 100.0 - tamper_score))
+    face_component = 100.0 if face_detected else 0.0
+    security_component = 100.0 if security_feature else 0.0
 
     score = round(
-        quality_component * 0.35
-        + visual_component * 0.30
-        + geometry_component * 0.20
-        + tamper_component * 0.15,
+        (
+            quality_component * 0.20
+            + visual_component * 0.20
+            + geometry_component * 0.20
+            + face_component * 0.15
+            + security_component * 0.25
+        ),
         2,
     )
 
-    # A high visual score must never turn a non-PAN into a PAN.
-    if not document_detected:
-        score = 0.0
+    verified = bool(
+        decision == "DOCUMENT_VERIFIED_SUCCESSFULLY"
+        and document_detected
+        and geometry_ok
+        and pan_identity
+        and photo_present
+        and face_detected
+        and security_feature
+        and tamper_risk == "LOW"
+    )
 
     elapsed = (
-        datetime.now() - start
+        datetime.now() - started
     ).total_seconds()
 
     return {
         "document_type": "PAN",
-        "decision": decision,
-        "score": score,
+        "decision": (
+            "DOCUMENT_VERIFIED_SUCCESSFULLY"
+            if verified
+            else decision
+        ),
+        "score": score if verified else 0.0,
         "validation": {
-            "document_detected": bool(document_detected),
-            "auto_cropped": bool(auto_cropped),
-            "image_quality": (
-                "GOOD"
-                if image_quality_score >= 80
-                else "FAIR"
-                if image_quality_score >= 55
-                else "POOR"
-            ),
+            "document_detected": document_detected,
+            "auto_cropped": auto_cropped,
+            "image_quality": image_quality,
             "tampering_risk": tamper_risk,
-            "visual_fields": visual_field_ratio,
+            "visual_fields": f"{visual_present}/{visual_total}",
             "photo_present": bool(photo_present),
             "face_detected": bool(face_detected),
-            "pan_identity": bool(
-                pan_identity["pan_identity"]
+            "pan_identity": bool(pan_identity),
+            "security_feature": bool(security_feature),
+            "qr_right": bool(security.get("qr_right", False)),
+            "security_block": bool(
+                security.get("security_block", False)
             ),
-            "security_feature": bool(
-                pan_identity.get("security_feature", False)
+            "security_block_score": float(
+                security.get("security_block_score", 0.0)
             ),
         },
         "processing_time_seconds": round(elapsed, 3),
         "ocr_used": False,
         "extraction_used": False,
-        # AUTHORITATIVE PAN GATE.
-        "verified": bool(
-            document_detected
-            and pan_identity["pan_identity"]
-            and photo_present
-            and face_detected
-            and tamper_risk == "LOW"
-            and image_quality_score >= 35.0
-        ),
+        "verified": verified,
     }
 
 
-# ============================================================================
-# IMAGE VERIFICATION
-# ============================================================================
 
 def _verify_image(
     image: np.ndarray,
@@ -4261,15 +4499,7 @@ def verify_pan_card(
             "Make sure the uploaded file is a valid image."
         )
 
-    # IMPORTANT: assign the validator result before any debug access.
-    result = _fast_pan_validation(image)
-
-    print("========== VERIFY_PAN_CARD FINAL RESULT ==========")
-    print("verified:", result.get("verified") if isinstance(result, dict) else None)
-    print("validation:", result.get("validation") if isinstance(result, dict) else None)
-    print("===================================================")
-
-    return result
+    return _fast_pan_validation(image)
 
 
 # ============================================================================
@@ -4839,13 +5069,3 @@ __all__ = [
     "extraction_logic_test",
     "extraction_logic_test_suite",
 ]
-
-
-PAN_CLASSIFIER_VERSION = "PAN-STRICT-V6-DEBUG"
-
-print("========== PAN VERIFICATION DEBUG LOADED ==========")
-print("PAN VERIFICATION FILE:", __file__)
-print("PAN CLASSIFIER VERSION:", PAN_CLASSIFIER_VERSION)
-print("===================================================")
-
-
