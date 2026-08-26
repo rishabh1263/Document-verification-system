@@ -1,27 +1,12 @@
 """
-Foreground feature extraction for signature verification.
+Signature image feature extraction.
 
-Pipeline:
+This module provides reusable image-processing functions for
+signature verification.
 
-    Image
-      ↓
-    Grayscale
-      ↓
-    Adaptive threshold
-      ↓
-    Remove long document lines
-      ↓
-    Remove border artifacts
-      ↓
-    Remove tiny noise
-      ↓
-    Group nearby foreground components
-      ↓
-    Signature candidate region
-      ↓
-    Extract geometric features
-
-This module does NOT classify an image as a signature.
+The output is intentionally descriptive rather than a final
+business decision. Final ACCEPT / REJECT / REVIEW logic belongs
+to the signature validator.
 """
 
 from dataclasses import dataclass
@@ -35,51 +20,47 @@ import numpy as np
 # Configuration
 # =========================================================
 
-# Adaptive threshold
-ADAPTIVE_BLOCK_SIZE = 31
-ADAPTIVE_C = 10
+# Foreground thresholding
+DEFAULT_THRESHOLD = 200
 
-# Hough line detection
-HOUGH_THRESHOLD = 50
-HOUGH_MIN_LINE_LENGTH_RATIO = 0.15
-HOUGH_MAX_LINE_GAP = 20
-
-# Lines close to horizontal are treated as document lines.
-MAX_HORIZONTAL_ANGLE = 12.0
-
-# Lines close to vertical near the image border are treated
-# as document borders.
-MAX_VERTICAL_ANGLE = 12.0
-
-BORDER_MARGIN_RATIO = 0.05
-
-# Small noise removal
+# Small connected components are usually noise.
 MIN_COMPONENT_AREA = 8
 
-# Component grouping.
-#
-# Nearby strokes belonging to the same signature will be
-# connected temporarily using this dilation kernel.
-GROUP_KERNEL_WIDTH = 21
-GROUP_KERNEL_HEIGHT = 11
+# Morphological processing
+MORPH_KERNEL_SIZE = 3
+
+# Document-line detection
+HOUGH_THRESHOLD = 50
+
+HOUGH_MIN_LINE_LENGTH_RATIO = 0.20
+
+HOUGH_MAX_LINE_GAP = 20
+
+DOCUMENT_LINE_THICKNESS = 3
 
 
 # =========================================================
-# Result
+# Result structure
 # =========================================================
 
 @dataclass
 class SignatureFeatures:
-    """Features extracted from the cleaned signature candidate."""
+    """
+    Extracted geometric/image features.
+    """
 
     image_width: int
+
     image_height: int
 
     foreground_density: float
 
     bbox_x: Optional[int]
+
     bbox_y: Optional[int]
+
     bbox_width: Optional[int]
+
     bbox_height: Optional[int]
 
     aspect_ratio: Optional[float]
@@ -96,105 +77,165 @@ class SignatureFeatures:
 
 
 # =========================================================
+# Validation helpers
+# =========================================================
+
+def _validate_image(
+    image: np.ndarray,
+) -> None:
+    """
+    Validate image input.
+    """
+
+    if image is None:
+
+        raise ValueError(
+            "Image cannot be None."
+        )
+
+    if not isinstance(
+        image,
+        np.ndarray,
+    ):
+
+        raise ValueError(
+            "Image must be a NumPy array."
+        )
+
+    if image.size == 0:
+
+        raise ValueError(
+            "Image cannot be empty."
+        )
+
+    if len(image.shape) not in (2, 3):
+
+        raise ValueError(
+            "Image must be grayscale or BGR."
+        )
+
+
+# =========================================================
 # Grayscale conversion
 # =========================================================
 
-def _to_grayscale(image: np.ndarray) -> np.ndarray:
-    """
-    Convert BGR, BGRA, or grayscale image to grayscale.
-    """
-
-    if len(image.shape) == 2:
-        return image
-
-    channels = image.shape[2]
-
-    if channels == 3:
-        return cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2GRAY
-        )
-
-    if channels == 4:
-        return cv2.cvtColor(
-            image,
-            cv2.COLOR_BGRA2GRAY
-        )
-
-    raise ValueError(
-        "Unsupported image channel format."
-    )
-
-
-# =========================================================
-# Raw foreground mask
-# =========================================================
-
-def _create_raw_foreground_mask(
-    image: np.ndarray
+def _to_grayscale(
+    image: np.ndarray,
 ) -> np.ndarray:
     """
-    Create an initial foreground mask using adaptive
-    thresholding.
+    Convert image to grayscale.
+
+    Supports both grayscale and BGR input.
     """
 
-    gray = _to_grayscale(image)
-
-    blurred = cv2.GaussianBlur(
-        gray,
-        (5, 5),
-        0
+    _validate_image(
+        image
     )
 
-    binary = cv2.adaptiveThreshold(
-        blurred,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        ADAPTIVE_BLOCK_SIZE,
-        ADAPTIVE_C
-    )
+    if len(image.shape) == 2:
 
-    return binary
+        return image.copy()
+
+    return cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY,
+    )
 
 
 # =========================================================
-# Detect document lines
+# Resize helper
+# =========================================================
+
+def _resize_for_processing(
+    gray: np.ndarray,
+    max_dimension: int = 1200,
+) -> tuple[np.ndarray, float]:
+    """
+    Resize image for expensive OpenCV operations.
+
+    Returns:
+        resized image
+        scale factor
+
+    scale represents:
+
+        resized = original * scale
+    """
+
+    height, width = gray.shape
+
+    largest_dimension = max(
+        height,
+        width,
+    )
+
+    if largest_dimension <= max_dimension:
+
+        return (
+            gray.copy(),
+            1.0,
+        )
+
+    scale = (
+        max_dimension /
+        largest_dimension
+    )
+
+    resized = cv2.resize(
+        gray,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_AREA,
+    )
+
+    return (
+        resized,
+        scale,
+    )
+
+
+# =========================================================
+# Document line detection
 # =========================================================
 
 def _detect_document_lines(
-    gray: np.ndarray
+    gray: np.ndarray,
 ) -> np.ndarray:
     """
     Detect long straight document/background lines.
 
     Hough line detection is used because photographed
-    documents can have lines that are slightly tilted.
+    documents can contain slightly tilted lines.
+
+    Returns:
+        Binary mask containing detected long lines.
     """
+
+    _validate_image(
+        gray
+    )
+
+    if len(gray.shape) != 2:
+
+        gray = _to_grayscale(
+            gray
+        )
 
     height, width = gray.shape
 
-    # Resize for faster processing.
-    scale = min(
-        1.0,
-        1000.0 / max(height, width)
+    (
+        small,
+        scale,
+    ) = _resize_for_processing(
+        gray,
+        max_dimension=1000,
     )
-
-    if scale < 1.0:
-        small = cv2.resize(
-            gray,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA
-        )
-    else:
-        small = gray.copy()
 
     edges = cv2.Canny(
         small,
         50,
-        150
+        150,
     )
 
     min_line_length = max(
@@ -202,7 +243,7 @@ def _detect_document_lines(
         int(
             small.shape[1] *
             HOUGH_MIN_LINE_LENGTH_RATIO
-        )
+        ),
     )
 
     lines = cv2.HoughLinesP(
@@ -211,121 +252,68 @@ def _detect_document_lines(
         theta=np.pi / 180,
         threshold=HOUGH_THRESHOLD,
         minLineLength=min_line_length,
-        maxLineGap=HOUGH_MAX_LINE_GAP
+        maxLineGap=HOUGH_MAX_LINE_GAP,
     )
 
     line_mask = np.zeros_like(
         small,
-        dtype=np.uint8
+        dtype=np.uint8,
     )
 
     if lines is None:
+
         return cv2.resize(
             line_mask,
             (width, height),
-            interpolation=cv2.INTER_NEAREST
+            interpolation=cv2.INTER_NEAREST,
         )
+
+    # -----------------------------------------------------
+    # IMPORTANT
+    #
+    # Depending on the OpenCV version/build,
+    # HoughLinesP can return either:
+    #
+    #     (N, 1, 4)
+    #
+    # or:
+    #
+    #     (N, 4)
+    #
+    # Therefore we flatten each line instead of
+    # assuming line[0] is always the coordinate array.
+    # -----------------------------------------------------
 
     for line in lines:
 
-        x1, y1, x2, y2 = line[0]
+        coordinates = np.asarray(
+            line
+        ).reshape(-1)
 
-        dx = x2 - x1
-        dy = y2 - y1
-
-        angle = np.degrees(
-            np.arctan2(
-                dy,
-                dx
-            )
-        )
-
-        absolute_angle = abs(angle)
-
-        if absolute_angle > 90:
-            absolute_angle = (
-                180 -
-                absolute_angle
-            )
-
-        line_length = np.sqrt(
-            dx * dx +
-            dy * dy
-        )
-
-        # -------------------------------------------------
-        # Horizontal document lines
-        # -------------------------------------------------
-
-        if (
-            absolute_angle <=
-            MAX_HORIZONTAL_ANGLE
-            and
-            line_length >=
-            min_line_length
-        ):
-
-            cv2.line(
-                line_mask,
-                (x1, y1),
-                (x2, y2),
-                255,
-                3
-            )
+        if coordinates.size != 4:
 
             continue
 
-        # -------------------------------------------------
-        # Vertical document borders
-        # -------------------------------------------------
-
-        distance_from_left = min(
-            x1,
-            x2
+        x1, y1, x2, y2 = (
+            int(coordinates[0]),
+            int(coordinates[1]),
+            int(coordinates[2]),
+            int(coordinates[3]),
         )
 
-        distance_from_right = min(
-            small.shape[1] - x1,
-            small.shape[1] - x2
+        cv2.line(
+            line_mask,
+            (x1, y1),
+            (x2, y2),
+            255,
+            DOCUMENT_LINE_THICKNESS,
         )
 
-        near_left_border = (
-            distance_from_left <
-            small.shape[1] *
-            BORDER_MARGIN_RATIO
-        )
-
-        near_right_border = (
-            distance_from_right <
-            small.shape[1] *
-            BORDER_MARGIN_RATIO
-        )
-
-        if (
-            abs(
-                90 -
-                absolute_angle
-            ) <= MAX_VERTICAL_ANGLE
-            and
-            (
-                near_left_border
-                or
-                near_right_border
-            )
-        ):
-
-            cv2.line(
-                line_mask,
-                (x1, y1),
-                (x2, y2),
-                255,
-                5
-            )
-
+    # Convert the resized mask back to original dimensions.
     line_mask = cv2.resize(
         line_mask,
         (width, height),
-        interpolation=cv2.INTER_NEAREST
+        interpolation=cv2.INTER_NEAREST,
     )
 
     return line_mask
@@ -336,456 +324,397 @@ def _detect_document_lines(
 # =========================================================
 
 def _remove_document_lines(
-    binary: np.ndarray,
-    gray: np.ndarray
+    gray: np.ndarray,
 ) -> np.ndarray:
     """
-    Remove long document/background lines.
+    Remove long straight document/background lines.
+
+    This is useful for forms and documents where horizontal
+    or vertical lines could otherwise be interpreted as
+    signature foreground.
     """
 
     line_mask = _detect_document_lines(
         gray
     )
 
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (5, 5)
+    result = gray.copy()
+
+    result[line_mask > 0] = 255
+
+    return result
+
+
+# =========================================================
+# Foreground mask
+# =========================================================
+
+def create_foreground_mask(
+    image: np.ndarray,
+) -> np.ndarray:
+    """
+    Create a binary foreground mask.
+
+    White pixels represent foreground.
+
+    Black pixels represent background.
+
+    This function is shared by the signature feature
+    extraction and image-context analysis pipelines.
+    """
+
+    _validate_image(
+        image
     )
 
-    line_mask = cv2.dilate(
-        line_mask,
+    gray = _to_grayscale(
+        image
+    )
+
+    # -----------------------------------------------------
+    # Normalize uneven lighting.
+    # -----------------------------------------------------
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (5, 5),
+        0,
+    )
+
+    # -----------------------------------------------------
+    # Remove long document/background lines.
+    # -----------------------------------------------------
+
+    line_removed = _remove_document_lines(
+        gray
+    )
+
+    # -----------------------------------------------------
+    # Adaptive thresholding.
+    #
+    # This handles photographed signatures better than
+    # a single fixed threshold.
+    # -----------------------------------------------------
+
+    adaptive = cv2.adaptiveThreshold(
+        line_removed,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        11,
+    )
+
+    # -----------------------------------------------------
+    # Otsu threshold.
+    # -----------------------------------------------------
+
+    _, otsu = cv2.threshold(
+        line_removed,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV +
+        cv2.THRESH_OTSU,
+    )
+
+    # -----------------------------------------------------
+    # Combine adaptive and Otsu masks.
+    # -----------------------------------------------------
+
+    mask = cv2.bitwise_and(
+        adaptive,
+        otsu,
+    )
+
+    # -----------------------------------------------------
+    # Morphological cleanup.
+    # -----------------------------------------------------
+
+    kernel = np.ones(
+        (
+            MORPH_KERNEL_SIZE,
+            MORPH_KERNEL_SIZE,
+        ),
+        dtype=np.uint8,
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
         kernel,
-        iterations=1
     )
 
-    cleaned = cv2.bitwise_and(
-        binary,
-        cv2.bitwise_not(line_mask)
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel,
     )
 
-    return cleaned
+    # -----------------------------------------------------
+    # Remove very small connected components.
+    # -----------------------------------------------------
 
-
-# =========================================================
-# Remove border artifacts
-# =========================================================
-
-def _remove_border_artifacts(
-    binary: np.ndarray
-) -> np.ndarray:
-    """
-    Remove foreground components touching the image border.
-
-    This prevents page edges/borders from becoming the
-    signature candidate.
-    """
-
-    height, width = binary.shape
-
-    num_labels, labels, stats, _ = (
+    number_of_labels, labels, stats, _ = (
         cv2.connectedComponentsWithStats(
-            binary,
-            connectivity=8
-        )
-    )
-
-    cleaned = binary.copy()
-
-    for label in range(
-        1,
-        num_labels
-    ):
-
-        x = stats[
-            label,
-            cv2.CC_STAT_LEFT
-        ]
-
-        y = stats[
-            label,
-            cv2.CC_STAT_TOP
-        ]
-
-        w = stats[
-            label,
-            cv2.CC_STAT_WIDTH
-        ]
-
-        h = stats[
-            label,
-            cv2.CC_STAT_HEIGHT
-        ]
-
-        touches_left = x <= 0
-        touches_top = y <= 0
-
-        touches_right = (
-            x + w >= width
-        )
-
-        touches_bottom = (
-            y + h >= height
-        )
-
-        if (
-            touches_left
-            or touches_top
-            or touches_right
-            or touches_bottom
-        ):
-
-            cleaned[
-                labels == label
-            ] = 0
-
-    return cleaned
-
-
-# =========================================================
-# Remove tiny components
-# =========================================================
-
-def _remove_small_components(
-    binary: np.ndarray
-) -> np.ndarray:
-    """
-    Remove very small isolated foreground components.
-
-    These are typically:
-        - camera noise
-        - JPEG artifacts
-        - tiny dots
-        - thresholding artifacts
-    """
-
-    num_labels, labels, stats, _ = (
-        cv2.connectedComponentsWithStats(
-            binary,
-            connectivity=8
+            mask,
+            connectivity=8,
         )
     )
 
     cleaned = np.zeros_like(
-        binary
+        mask
     )
 
-    for label in range(
+    for index in range(
         1,
-        num_labels
+        number_of_labels,
     ):
 
         area = stats[
-            label,
-            cv2.CC_STAT_AREA
+            index,
+            cv2.CC_STAT_AREA,
         ]
 
         if area >= MIN_COMPONENT_AREA:
 
             cleaned[
-                labels == label
+                labels == index
             ] = 255
 
     return cleaned
 
 
 # =========================================================
-# Group nearby components
+# Foreground bounding box
 # =========================================================
 
-def _group_signature_components(
-    binary: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def _get_foreground_bbox(
+    mask: np.ndarray,
+) -> Optional[
+    tuple[int, int, int, int]
+]:
     """
-    Group nearby foreground components.
-
-    A signature can consist of several disconnected strokes.
-    We therefore temporarily dilate nearby components so that
-    strokes belonging to the same signature become one
-    candidate region.
-
-    Returns
-    -------
-    grouped_mask:
-        Temporary mask used to identify candidate regions.
-
-    cleaned_binary:
-        Original foreground pixels with tiny noise removed.
+    Get bounding box around all foreground pixels.
     """
 
-    cleaned_binary = _remove_small_components(
-        binary
+    points = cv2.findNonZero(
+        mask
     )
 
-    grouping_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (
-            GROUP_KERNEL_WIDTH,
-            GROUP_KERNEL_HEIGHT
+    if points is None:
+
+        return None
+
+    x, y, width, height = (
+        cv2.boundingRect(
+            points
         )
-    )
-
-    grouped_mask = cv2.dilate(
-        cleaned_binary,
-        grouping_kernel,
-        iterations=1
-    )
-
-    # Close small gaps between nearby strokes.
-    grouped_mask = cv2.morphologyEx(
-        grouped_mask,
-        cv2.MORPH_CLOSE,
-        grouping_kernel,
-        iterations=1
     )
 
     return (
-        grouped_mask,
-        cleaned_binary
+        x,
+        y,
+        width,
+        height,
     )
 
 
 # =========================================================
-# Public foreground mask
+# Connected components
 # =========================================================
 
-def create_foreground_mask(
-    image: np.ndarray
-) -> np.ndarray:
+def _get_component_count(
+    mask: np.ndarray,
+) -> int:
     """
-    Create a cleaned foreground mask.
-
-    Returns:
-
-        0   = background
-        255 = foreground
+    Count meaningful connected components.
     """
 
-    if image is None:
-        raise ValueError(
-            "Image cannot be None."
+    number_of_labels, _, stats, _ = (
+        cv2.connectedComponentsWithStats(
+            mask,
+            connectivity=8,
         )
+    )
 
-    if not isinstance(
-        image,
-        np.ndarray
+    count = 0
+
+    for index in range(
+        1,
+        number_of_labels,
     ):
-        raise ValueError(
-            "Image must be a NumPy array."
-        )
 
-    if image.size == 0:
-        raise ValueError(
-            "Image cannot be empty."
-        )
+        area = stats[
+            index,
+            cv2.CC_STAT_AREA,
+        ]
 
-    gray = _to_grayscale(
-        image
-    )
+        if area >= MIN_COMPONENT_AREA:
 
-    raw_mask = _create_raw_foreground_mask(
-        image
-    )
+            count += 1
 
-    line_removed = _remove_document_lines(
-        raw_mask,
-        gray
-    )
-
-    border_removed = _remove_border_artifacts(
-        line_removed
-    )
-
-    cleaned = _remove_small_components(
-        border_removed
-    )
-
-    return cleaned
+    return count
 
 
 # =========================================================
-# Feature extraction
+# Contours
+# =========================================================
+
+def _get_contour_features(
+    mask: np.ndarray,
+) -> tuple[
+    int,
+    float,
+    float,
+]:
+    """
+    Calculate contour count and contour areas.
+    """
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if not contours:
+
+        return (
+            0,
+            0.0,
+            0.0,
+        )
+
+    areas = []
+
+    for contour in contours:
+
+        area = cv2.contourArea(
+            contour
+        )
+
+        if area > 0:
+
+            areas.append(
+                float(area)
+            )
+
+    if not areas:
+
+        return (
+            0,
+            0.0,
+            0.0,
+        )
+
+    return (
+        len(areas),
+        max(areas),
+        sum(areas),
+    )
+
+
+# =========================================================
+# Main feature extraction
 # =========================================================
 
 def extract_signature_features(
-    image: np.ndarray
+    image: np.ndarray,
 ) -> SignatureFeatures:
     """
-    Extract geometric features from the foreground.
+    Extract signature-related geometric features.
 
-    Important:
-
-    The largest individual stroke is NOT assumed to be
-    the entire signature.
-
-    Nearby components are grouped first and the resulting
-    candidate region is used for the signature bounding box.
+    This function does not decide whether the image
+    contains a valid signature.
     """
 
-    if image is None:
-        raise ValueError(
-            "Image cannot be None."
-        )
-
-    if not isinstance(
-        image,
-        np.ndarray
-    ):
-        raise ValueError(
-            "Image must be a NumPy array."
-        )
-
-    if image.size == 0:
-        raise ValueError(
-            "Image cannot be empty."
-        )
-
-    image_height, image_width = (
-        image.shape[:2]
-    )
-
-    # -----------------------------------------------------
-    # Create cleaned foreground
-    # -----------------------------------------------------
-
-    binary = create_foreground_mask(
+    _validate_image(
         image
     )
 
-    # -----------------------------------------------------
-    # Foreground density
-    # -----------------------------------------------------
+    height, width = (
+        image.shape[:2]
+    )
 
-    foreground_pixels = (
-        cv2.countNonZero(
-            binary
+    if (
+        height <= 0
+        or
+        width <= 0
+    ):
+
+        raise ValueError(
+            "Image dimensions must be positive."
         )
+
+    mask = create_foreground_mask(
+        image
     )
 
     total_pixels = (
-        image_width *
-        image_height
+        width *
+        height
     )
 
-    foreground_density = (
-        foreground_pixels /
-        total_pixels
-    )
-
-    # -----------------------------------------------------
-    # Group nearby components
-    # -----------------------------------------------------
-
-    grouped_mask, cleaned_binary = (
-        _group_signature_components(
-            binary
+    foreground_pixels = (
+        cv2.countNonZero(
+            mask
         )
     )
 
-    # -----------------------------------------------------
-    # Find grouped candidate components
-    # -----------------------------------------------------
+    if total_pixels > 0:
 
-    (
-        grouped_labels,
-        grouped_stats
-    ) = _get_component_stats(
-        grouped_mask
+        foreground_density = (
+            foreground_pixels /
+            total_pixels
+        )
+
+    else:
+
+        foreground_density = 0.0
+
+    foreground_density = round(
+        foreground_density,
+        6,
     )
 
-    candidate_label = None
-
-    if len(grouped_stats) > 1:
-
-        # Ignore background label 0.
-        candidate_areas = (
-            grouped_stats[
-                1:,
-                cv2.CC_STAT_AREA
-            ]
-        )
-
-        candidate_label = (
-            int(
-                np.argmax(
-                    candidate_areas
-                )
-            ) + 1
-        )
-
     # -----------------------------------------------------
-    # Defaults
+    # Bounding box
     # -----------------------------------------------------
 
-    bbox_x = None
-    bbox_y = None
-    bbox_width = None
-    bbox_height = None
+    bbox = _get_foreground_bbox(
+        mask
+    )
 
-    aspect_ratio = None
-    occupancy_ratio = None
+    if bbox is None:
 
-    # -----------------------------------------------------
-    # Candidate bounding box
-    # -----------------------------------------------------
+        bbox_x = None
+        bbox_y = None
+        bbox_width = None
+        bbox_height = None
 
-    if candidate_label is not None:
+        aspect_ratio = None
+        occupancy_ratio = None
 
-        bbox_x = int(
-            grouped_stats[
-                candidate_label,
-                cv2.CC_STAT_LEFT
-            ]
-        )
+    else:
 
-        bbox_y = int(
-            grouped_stats[
-                candidate_label,
-                cv2.CC_STAT_TOP
-            ]
-        )
-
-        bbox_width = int(
-            grouped_stats[
-                candidate_label,
-                cv2.CC_STAT_WIDTH
-            ]
-        )
-
-        bbox_height = int(
-            grouped_stats[
-                candidate_label,
-                cv2.CC_STAT_HEIGHT
-            ]
-        )
+        (
+            bbox_x,
+            bbox_y,
+            bbox_width,
+            bbox_height,
+        ) = bbox
 
         if bbox_height > 0:
 
-            aspect_ratio = (
+            aspect_ratio = round(
                 bbox_width /
-                bbox_height
+                bbox_height,
+                4,
             )
 
-        # -------------------------------------------------
-        # Calculate occupancy using ORIGINAL foreground
-        # pixels inside the grouped bounding box.
-        # -------------------------------------------------
+        else:
 
-        x1 = bbox_x
-        y1 = bbox_y
-
-        x2 = bbox_x + bbox_width
-        y2 = bbox_y + bbox_height
-
-        roi = cleaned_binary[
-            y1:y2,
-            x1:x2
-        ]
-
-        roi_foreground_pixels = (
-            cv2.countNonZero(
-                roi
-            )
-        )
+            aspect_ratio = None
 
         bbox_area = (
             bbox_width *
@@ -794,74 +723,44 @@ def extract_signature_features(
 
         if bbox_area > 0:
 
-            occupancy_ratio = (
-                roi_foreground_pixels /
-                bbox_area
+            occupancy_ratio = round(
+                foreground_pixels /
+                bbox_area,
+                6,
             )
 
+        else:
+
+            occupancy_ratio = None
+
     # -----------------------------------------------------
-    # Raw connected components
+    # Components
     # -----------------------------------------------------
 
-    num_labels, _, _, _ = (
-        cv2.connectedComponentsWithStats(
-            cleaned_binary,
-            connectivity=8
+    connected_components = (
+        _get_component_count(
+            mask
         )
-    )
-
-    connected_components = max(
-        num_labels - 1,
-        0
     )
 
     # -----------------------------------------------------
     # Contours
     # -----------------------------------------------------
 
-    contours, _ = cv2.findContours(
-        cleaned_binary,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+    (
+        contour_count,
+        largest_contour_area,
+        total_contour_area,
+    ) = _get_contour_features(
+        mask
     )
-
-    contour_count = len(
-        contours
-    )
-
-    largest_contour_area = 0.0
-    total_contour_area = 0.0
-
-    if contours:
-
-        contour_areas = [
-            float(
-                cv2.contourArea(
-                    contour
-                )
-            )
-            for contour in contours
-        ]
-
-        largest_contour_area = max(
-            contour_areas
-        )
-
-        total_contour_area = sum(
-            contour_areas
-        )
-
-    # -----------------------------------------------------
-    # Return
-    # -----------------------------------------------------
 
     return SignatureFeatures(
-        image_width=image_width,
-        image_height=image_height,
+        image_width=width,
+        image_height=height,
 
-        foreground_density=round(
-            foreground_density,
-            6
+        foreground_density=(
+            foreground_density
         ),
 
         bbox_x=bbox_x,
@@ -870,22 +769,10 @@ def extract_signature_features(
         bbox_width=bbox_width,
         bbox_height=bbox_height,
 
-        aspect_ratio=(
-            round(
-                aspect_ratio,
-                4
-            )
-            if aspect_ratio is not None
-            else None
-        ),
+        aspect_ratio=aspect_ratio,
 
         occupancy_ratio=(
-            round(
-                occupancy_ratio,
-                6
-            )
-            if occupancy_ratio is not None
-            else None
+            occupancy_ratio
         ),
 
         connected_components=(
@@ -898,35 +785,11 @@ def extract_signature_features(
 
         largest_contour_area=round(
             largest_contour_area,
-            2
+            4,
         ),
 
         total_contour_area=round(
             total_contour_area,
-            2
-        )
-    )
-
-
-# =========================================================
-# Connected component helper
-# =========================================================
-
-def _get_component_stats(
-    binary: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Return connected-component labels and statistics.
-    """
-
-    num_labels, labels, stats, _ = (
-        cv2.connectedComponentsWithStats(
-            binary,
-            connectivity=8
-        )
-    )
-
-    return (
-        labels,
-        stats
+            4,
+        ),
     )

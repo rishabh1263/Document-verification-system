@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 
 import cv2
-from insightface.app import FaceAnalysis
 
+from .model import get_face_app
 from .schemas import (
     DetectedFace,
     FaceDetectionResult,
@@ -32,23 +32,13 @@ class FaceDetector:
 
     def __init__(self):
         """
-        Load InsightFace once.
+        Load the shared InsightFace model.
 
-        The detector instance should be reused for
-        multiple documents.
+        The actual FaceAnalysis instance is created only once
+        per Python process by get_face_app().
         """
 
-        self.app = FaceAnalysis(
-            name="buffalo_l",
-            providers=[
-                "CPUExecutionProvider"
-            ],
-        )
-
-        self.app.prepare(
-            ctx_id=0,
-            det_size=(640, 640),
-        )
+        self.app = get_face_app()
 
     def detect(
         self,
@@ -56,6 +46,14 @@ class FaceDetector:
     ) -> FaceDetectionResult:
         """
         Detect all faces from an image file.
+
+        Args:
+            image_path:
+                Path to the image file.
+
+        Returns:
+            FaceDetectionResult containing detected faces,
+            count, and detection latency.
         """
 
         image = cv2.imread(image_path)
@@ -79,79 +77,52 @@ class FaceDetector:
                 OpenCV BGR image.
 
         Returns:
-            FaceDetectionResult
+            FaceDetectionResult.
         """
 
         start_time = time.perf_counter()
 
-        if image is None:
-            raise ValueError(
-                "Image is empty."
-            )
-
-        if len(image.shape) != 3:
-            raise ValueError(
-                "Image must be a 3-channel BGR image."
-            )
-
         faces = self.app.get(image)
 
-        processing_time_ms = (
-            time.perf_counter()
-            - start_time
+        detection_time_ms = (
+            time.perf_counter() - start_time
         ) * 1000
 
         detected_faces = []
 
-        height, width = image.shape[:2]
-
         for face in faces:
+
+            bbox = face.bbox
 
             x1, y1, x2, y2 = map(
                 int,
-                face.bbox,
+                bbox,
             )
 
-            # Keep bounding box inside image.
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(width, x2)
-            y2 = min(height, y2)
+            width = max(0, x2 - x1)
+            height = max(0, y2 - y1)
 
-            # Calculate face dimensions.
-            face_width = x2 - x1
-            face_height = y2 - y1
+            area = width * height
 
-            # Calculate face area.
-            face_area = (
-                face_width
-                * face_height
+            confidence = float(
+                face.det_score
             )
 
             detected_faces.append(
                 DetectedFace(
-                    confidence=float(
-                        face.det_score
-                    ),
-                    bounding_box=(
+                    bbox=[
                         x1,
                         y1,
                         x2,
                         y2,
-                    ),
-                    area=face_area,
+                    ],
+                    confidence=confidence,
+                    area=area,
                 )
             )
 
         return FaceDetectionResult(
-            detected=(
-                len(detected_faces) > 0
-            ),
-            face_count=len(
-                detected_faces
-            ),
             faces=detected_faces,
-            processing_time_ms=(
-                processing_time_ms
-            ),
+            face_count=len(detected_faces),
+            detection_time_ms=detection_time_ms,
         )

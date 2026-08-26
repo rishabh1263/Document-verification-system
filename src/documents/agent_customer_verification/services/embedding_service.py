@@ -3,21 +3,23 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from insightface.app import FaceAnalysis
+from src.common.face.model import get_face_app
 
-from src.documents.agent_customer_verification.exceptions import InvalidImageException
-from src.documents.agent_customer_verification.services.glasses_detector import detect_glasses
+from src.documents.agent_customer_verification.exceptions import (
+    InvalidImageException,
+)
+from src.documents.agent_customer_verification.services.glasses_detector import (
+    detect_glasses,
+)
 
 
 class EmbeddingService:
 
     def __init__(self):
 
-        self.app = FaceAnalysis(name="buffalo_l")
-        self.app.prepare(
-            ctx_id=0,
-            det_size=(640, 640)
-        )
+        # Use the shared InsightFace buffalo_l instance.
+        # This prevents loading the model again.
+        self.app = get_face_app()
 
     def detect_faces(self, image_path: str):
 
@@ -70,8 +72,8 @@ class EmbeddingService:
                 "id": index + 1,
                 "bbox": face.bbox.tolist(),
                 "score": float(face.det_score),
-                "embedding": face.embedding
-            }
+                "embedding": face.embedding,
+            },
         }
 
     def get_face_embeddings(self, image_path: str):
@@ -83,7 +85,7 @@ class EmbeddingService:
             return {
                 "success": False,
                 "message": "Exactly two faces must be present.",
-                "faces": len(faces)
+                "faces": len(faces),
             }
 
         print("\nRunning glasses detection in parallel...\n")
@@ -95,14 +97,19 @@ class EmbeddingService:
                     self.process_face,
                     image,
                     face,
-                    index
+                    index,
                 )
                 for index, face in enumerate(faces)
             ]
 
-            results = [future.result() for future in futures]
+            results = [
+                future.result()
+                for future in futures
+            ]
 
-        results.sort(key=lambda x: x["index"])
+        results.sort(
+            key=lambda x: x["index"]
+        )
 
         detected_faces = []
 
@@ -114,24 +121,32 @@ class EmbeddingService:
 
                 return {
                     "success": False,
-                    "message": f"Glasses detector error: {glasses['error']}"
+                    "message": (
+                        f"Glasses detector error: "
+                        f"{glasses['error']}"
+                    ),
                 }
 
             if glasses["glasses"]:
 
                 return {
                     "success": False,
-                    "message": "Please remove spectacles and capture the selfie again.",
+                    "message": (
+                        "Please remove spectacles and "
+                        "capture the selfie again."
+                    ),
                     "face": result["index"] + 1,
-                    "confidence": glasses["confidence"]
+                    "confidence": glasses["confidence"],
                 }
 
-            detected_faces.append(result["face"])
+            detected_faces.append(
+                result["face"]
+            )
 
-        print("\nâœ“ No spectacles detected.")
+        print("\n✓ No spectacles detected.")
 
         return {
             "success": True,
             "image": image,
-            "faces": detected_faces
+            "faces": detected_faces,
         }

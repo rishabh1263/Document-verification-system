@@ -16,7 +16,31 @@ Registered modules:
     10. Voter ID
     11. CIBIL
     12. CRIF
+    13. Signature Verification
 """
+
+from __future__ import annotations
+
+
+# ======================================================================
+# SSL BOOTSTRAP
+# ======================================================================
+#
+# Must run BEFORE importing the master API router.
+#
+# Some imported services initialize external ML models during startup.
+# truststore allows Python to use the Windows/system certificate store.
+# ======================================================================
+
+from src.ssl_bootstrap import initialize_ssl
+
+
+initialize_ssl()
+
+
+# ======================================================================
+# FASTAPI
+# ======================================================================
 
 from fastapi import FastAPI
 
@@ -41,7 +65,7 @@ app = FastAPI(
 # ======================================================================
 
 app.include_router(
-    api_router
+    api_router,
 )
 
 
@@ -53,7 +77,8 @@ app.include_router(
     "/",
     tags=["System"],
 )
-def root():
+def root() -> dict[str, str]:
+
     return {
         "status": "running",
         "service": "Document Verification System",
@@ -69,7 +94,8 @@ def root():
     "/health",
     tags=["System"],
 )
-def health():
+def health() -> dict[str, str]:
+
     return {
         "status": "healthy",
     }

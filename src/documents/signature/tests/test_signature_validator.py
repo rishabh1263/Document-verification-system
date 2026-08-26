@@ -1,121 +1,235 @@
+"""
+Tests for the signature validation pipeline.
+
+The validator now uses the trained MobileNetV3 classifier
+as the primary signature detector.
+"""
+
 import cv2
 import numpy as np
 
 from src.documents.signature.services.signature_validator import (
     SignatureDecision,
-    validate_signature
+    validate_signature,
 )
 
 
-def create_signature_like_image():
+# =========================================================
+# Helpers
+# =========================================================
 
-    image = np.full(
-        (500, 1000, 3),
-        255,
-        dtype=np.uint8
+REAL_SIGNATURE_IMAGE = (
+    "data/signature_classifier/"
+    "val/signature/signature_00001.jpg"
+)
+
+
+def create_white_image():
+
+    return np.ones(
+        (
+            500,
+            1000,
+            3,
+        ),
+        dtype=np.uint8,
+    ) * 255
+
+
+def create_black_image():
+
+    return np.zeros(
+        (
+            500,
+            1000,
+            3,
+        ),
+        dtype=np.uint8,
     )
 
-    points = np.array(
-        [
-            [250, 280],
-            [300, 220],
-            [350, 300],
-            [400, 210],
-            [450, 290],
-            [520, 230],
-            [600, 270],
-            [680, 210],
-        ],
-        dtype=np.int32
-    )
 
-    cv2.polylines(
-        image,
-        [points],
-        False,
-        (0, 0, 0),
-        5
-    )
-
-    cv2.line(
-        image,
-        (300, 330),
-        (650, 300),
-        (0, 0, 0),
-        4
-    )
-
-    return image
-
+# =========================================================
+# None image
+# =========================================================
 
 def test_none_image_rejected():
 
-    result = validate_signature(None)
+    result = validate_signature(
+        None
+    )
 
-    assert result.decision == SignatureDecision.REJECT
-    assert result.reason_code == "INVALID_IMAGE"
+    assert (
+        result.decision
+        == SignatureDecision.REJECT
+    )
 
+    assert (
+        result.reason_code
+        == "INVALID_IMAGE"
+    )
+
+    assert result.features is None
+
+
+# =========================================================
+# Empty image
+# =========================================================
 
 def test_empty_image_rejected():
 
-    image = np.array(
-        [],
-        dtype=np.uint8
+    image = np.empty(
+        (
+            0,
+            0,
+            3,
+        ),
+        dtype=np.uint8,
     )
 
-    result = validate_signature(image)
+    result = validate_signature(
+        image
+    )
 
-    assert result.decision == SignatureDecision.REJECT
+    assert (
+        result.decision
+        == SignatureDecision.REJECT
+    )
 
+    assert (
+        result.reason_code
+        == "INVALID_IMAGE"
+    )
+
+
+# =========================================================
+# White image
+# =========================================================
 
 def test_white_image_rejected():
 
-    image = np.full(
-        (500, 1000, 3),
-        255,
-        dtype=np.uint8
+    image = create_white_image()
+
+    result = validate_signature(
+        image
     )
 
-    result = validate_signature(image)
-
-    assert result.decision == SignatureDecision.REJECT
-
-
-def test_signature_like_image():
-
-    image = create_signature_like_image()
-
-    result = validate_signature(image)
-
-    print("\n========== SIGNATURE VALIDATOR ==========")
-    print(
-        f"Decision   : {result.decision.value}"
-    )
-    print(
-        f"Confidence : {result.confidence}"
-    )
-    print(
-        f"Reason     : {result.reason_code}"
-    )
-    print(
-        f"Message    : {result.message}"
+    assert (
+        result.decision
+        == SignatureDecision.REJECT
     )
 
     assert result.features is not None
 
-    assert result.decision in (
-        SignatureDecision.ACCEPT,
-        SignatureDecision.REVIEW
+    assert (
+        result.reason_code
+        == "BLANK_IMAGE"
     )
 
+
+# =========================================================
+# Solid black image
+# =========================================================
 
 def test_solid_black_image_not_accepted():
 
-    image = np.zeros(
-        (500, 1000, 3),
-        dtype=np.uint8
+    image = create_black_image()
+
+    result = validate_signature(
+        image
     )
 
-    result = validate_signature(image)
+    assert (
+        result.decision
+        != SignatureDecision.ACCEPT
+    )
 
-    assert result.decision != SignatureDecision.ACCEPT
+
+# =========================================================
+# Real signature image
+# =========================================================
+
+def test_signature_like_image():
+
+    image = cv2.imread(
+        REAL_SIGNATURE_IMAGE
+    )
+
+    assert image is not None
+
+    result = validate_signature(
+        image
+    )
+
+    print(
+        "\n========== SIGNATURE VALIDATOR =========="
+    )
+
+    print(
+        f"Decision   : {result.decision.value}"
+    )
+
+    print(
+        f"Confidence : {result.confidence}"
+    )
+
+    print(
+        f"Reason     : {result.reason_code}"
+    )
+
+    print(
+        f"Message    : {result.message}"
+    )
+
+    if result.classifier:
+
+        print(
+            "Signature probability : "
+            f"{result.classifier.signature_probability}"
+        )
+
+        print(
+            "Non-signature probability : "
+            f"{result.classifier.non_signature_probability}"
+        )
+
+        print(
+            "Classifier prediction : "
+            f"{result.classifier.predicted_class}"
+        )
+
+    # -----------------------------------------------------
+    # Features must exist
+    # -----------------------------------------------------
+
+    assert result.features is not None
+
+    # -----------------------------------------------------
+    # Classifier must exist
+    # -----------------------------------------------------
+
+    assert result.classifier is not None
+
+    # -----------------------------------------------------
+    # Real validation image must be classified
+    # as a signature.
+    # -----------------------------------------------------
+
+    assert (
+        result.classifier.is_signature
+        is True
+    )
+
+    assert (
+        result.classifier.signature_probability
+        >= 0.90
+    )
+
+    # -----------------------------------------------------
+    # A genuine signature should never be rejected
+    # by the signature classifier pipeline.
+    # -----------------------------------------------------
+
+    assert result.decision in (
+        SignatureDecision.ACCEPT,
+        SignatureDecision.REVIEW,
+    )

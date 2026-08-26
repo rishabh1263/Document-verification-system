@@ -1,21 +1,17 @@
 ﻿import cv2
-from insightface.app import FaceAnalysis
+
+from src.common.face.model import get_face_app
 
 
 class FaceService:
 
     def __init__(self):
 
-        print("Loading InsightFace Model...")
+        print("Loading shared InsightFace Model...")
 
-        self.app = FaceAnalysis(name="buffalo_l")
+        self.app = get_face_app()
 
-        self.app.prepare(
-            ctx_id=0,
-            det_size=(640, 640)
-        )
-
-        print("InsightFace Loaded Successfully")
+        print("InsightFace Model Ready")
 
     def detect_face(self, image_path: str):
 
@@ -39,11 +35,8 @@ class FaceService:
             )
 
         return {
-
             "image": image,
-
-            "face": faces[0]
-
+            "face": faces[0],
         }
 
 

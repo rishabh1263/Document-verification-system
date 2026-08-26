@@ -12,6 +12,7 @@ Important:
 
 from fastapi import APIRouter
 
+
 router = APIRouter()
 
 
@@ -26,7 +27,13 @@ from src.documents.bank_statement.api.routes import (
 router.include_router(
     bank_statement_router,
 )
+from src.documents.signature.api.signature_api import (
+    router as signature_router,
+)
 
+router.include_router(
+    signature_router,
+)
 
 # ======================================================================
 # PASSPORT
@@ -202,6 +209,29 @@ from src.documents.crif.router import (
 
 router.include_router(
     crif_router,
+)
+
+
+# ======================================================================
+# SIGNATURE VERIFICATION
+# ======================================================================
+#
+# Endpoint:
+#
+#     POST /signature/verify
+#
+# The signature router itself does NOT define the /signature prefix.
+# The master router owns the public URL prefix.
+# ======================================================================
+
+from src.documents.signature.api.signature_api import (
+    router as signature_router,
+)
+
+router.include_router(
+    signature_router,
+    prefix="/signature",
+    tags=["Signature"],
 )
 
 
