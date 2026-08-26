@@ -1,7 +1,10 @@
 ﻿"""
 Signature validation layer.
 
-Pipeline:
+Pipeline
+--------
+
+FAST PATH:
 
     IMAGE
       |
@@ -11,32 +14,49 @@ Pipeline:
       |
       +-- MobileNetV3 classifier
       |
-      +-- YOLOS signature detection
+      +-- Graphic / logo guard
       |
-      +-- Region reliability filtering
-      |
-      +-- OpenCV fallback region validation
-      |
-      +-- Whole-image context
-      |
-      +-- Conservative decision logic
+      +-- Cheap geometry checks
       |
       +-- ACCEPT / REVIEW / REJECT
 
-MobileNetV3:
-    Primary signature classifier.
+ESCALATION PATH:
 
-YOLOS:
-    Signature-region detector.
+    IMAGE
+      |
+      +-- OpenCV feature extraction
+      |
+      +-- MobileNetV3 classifier
+      |
+      +-- Suspicious / ambiguous
+      |
+      +-- YOLOS signature detection
+      |
+      +-- Whole-image context
+      |
+      +-- ACCEPT / REVIEW / REJECT
 
-OpenCV:
-    Geometry and image-structure fallback.
+Important
+---------
 
-Important:
-    YOLOS detections are NOT automatically trusted.
+MobileNet classification alone must NEVER be treated as proof
+that an image is a genuine standalone handwritten signature.
 
-    A very large YOLOS box, for example a box covering
-    most of the image, is considered an unreliable region.
+A logo, graphic, seal, printed signature illustration, or other
+signature-like graphic can receive a very high MobileNet score.
+
+Therefore automatic acceptance requires:
+
+    classifier confidence
+    +
+    reasonable handwriting-like geometry
+    +
+    no strong graphic/logo signal
+    +
+    no obvious document signal
+
+YOLOS is reserved for ambiguous/suspicious cases because it is
+considerably slower than OpenCV + MobileNet.
 
 Supported input modes:
 
@@ -50,6 +70,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+import time
 
 import numpy as np
 
@@ -133,9 +155,39 @@ class SignatureValidationResult:
 # Configuration
 # =========================================================
 
+# ---------------------------------------------------------
+# MobileNet thresholds
+# ---------------------------------------------------------
+
 SIGNATURE_ACCEPT_THRESHOLD = 0.90
 
 SIGNATURE_REVIEW_THRESHOLD = 0.50
+
+
+# =========================================================
+# FAST PATH
+# =========================================================
+
+FAST_ACCEPT_CLASSIFIER_THRESHOLD = 0.98
+
+FAST_MAX_FOREGROUND_DENSITY = 0.08
+
+FAST_MAX_COMPONENTS = 80
+
+FAST_MIN_COMPONENTS = 2
+
+FAST_MIN_OCCUPANCY_RATIO = 0.005
+
+FAST_MAX_OCCUPANCY_RATIO = 0.65
+
+FAST_MIN_ASPECT_RATIO = 0.20
+
+FAST_MAX_ASPECT_RATIO = 8.00
+
+
+# =========================================================
+# General image safety
+# =========================================================
 
 MAX_FOREGROUND_DENSITY = 0.35
 
@@ -147,36 +199,40 @@ DOCUMENT_CONTEXT_COMPONENTS = 150
 
 SMALL_SIGNATURE_AREA_RATIO = 0.02
 
-ACCEPT_CONFIDENCE = 0.95
-
-REVIEW_CONFIDENCE = 0.60
-
-REJECT_CONFIDENCE = 0.95
-
 
 # =========================================================
-# YOLOS configuration
+# Graphic / logo protection
 # =========================================================
 
-# Normal YOLOS detection.
-YOLOS_PRIMARY_THRESHOLD = 0.50
+"""
+These rules are NOT designed to identify a specific website,
+company, logo, or image.
 
-# Used only when MobileNet strongly believes the image
-# is a signature but primary YOLOS cannot find a region.
-YOLOS_FALLBACK_THRESHOLD = 0.10
+They detect a general visual pattern:
 
-# A YOLOS box occupying more than this percentage of the
-# entire image is not considered a reliable signature box.
-MAX_RELIABLE_REGION_AREA_RATIO = 0.45
+    high classifier confidence
+        +
+    relatively large structured foreground
+        +
+    few connected components
+        +
+    dominant contour
 
-# A signature should not normally occupy almost the complete
-# width and height of the submitted image.
-MAX_RELIABLE_REGION_WIDTH_RATIO = 0.90
+That pattern is suspicious for a graphic/illustration.
 
-MAX_RELIABLE_REGION_HEIGHT_RATIO = 0.90
+This prevents a signature-like logo/graphic from receiving
+automatic ACCEPT solely because MobileNet is confident.
+"""
 
-# Minimum confidence for a fallback YOLOS detection.
-YOLOS_FALLBACK_MIN_CONFIDENCE = 0.12
+GRAPHIC_MIN_FOREGROUND_DENSITY = 0.055
+
+GRAPHIC_MIN_OCCUPANCY_RATIO = 0.08
+
+GRAPHIC_MAX_COMPONENTS = 15
+
+GRAPHIC_DOMINANT_CONTOUR_RATIO = 0.55
+
+GRAPHIC_LARGE_CONTOUR_IMAGE_RATIO = 0.040
 
 
 # =========================================================
@@ -187,15 +243,12 @@ MULTIPLE_SIGNATURE_IOU_THRESHOLD = 0.25
 
 MULTIPLE_SIGNATURE_CONTAINMENT_THRESHOLD = 0.60
 
-# Two regions that are very close vertically and have
-# significant horizontal overlap are often different
-# detections of the same physical signature.
-VERTICAL_PROXIMITY_THRESHOLD = 0.04
 
-CENTER_VERTICAL_RATIO_THRESHOLD = 0.75
+# =========================================================
+# Timing
+# =========================================================
 
-# Combined region should not look like a full document.
-MAX_COMBINED_AREA_RATIO = 0.45
+ENABLE_TIMING_LOG = False
 
 
 # =========================================================
@@ -249,7 +302,7 @@ def _validate_input_image(
 
 
 # =========================================================
-# Invalid image
+# Invalid result
 # =========================================================
 
 def _invalid_result(
@@ -260,7 +313,7 @@ def _invalid_result(
 
         decision=SignatureDecision.REJECT,
 
-        confidence=REJECT_CONFIDENCE,
+        confidence=0.95,
 
         reason_code="INVALID_IMAGE",
 
@@ -296,7 +349,7 @@ def _reject(
 
         decision=SignatureDecision.REJECT,
 
-        confidence=REJECT_CONFIDENCE,
+        confidence=0.95,
 
         reason_code=reason_code,
 
@@ -332,7 +385,7 @@ def _review(
 
         decision=SignatureDecision.REVIEW,
 
-        confidence=REVIEW_CONFIDENCE,
+        confidence=0.60,
 
         reason_code=reason_code,
 
@@ -364,7 +417,7 @@ def _accept(
 
         decision=SignatureDecision.ACCEPT,
 
-        confidence=ACCEPT_CONFIDENCE,
+        confidence=0.95,
 
         reason_code=reason_code,
 
@@ -530,171 +583,8 @@ def _calculate_iou(
     )
 
 
-def _box_center(
-    box: tuple[
-        float,
-        float,
-        float,
-        float,
-    ],
-) -> tuple[
-    float,
-    float,
-]:
-
-    x1, y1, x2, y2 = box
-
-    return (
-        (x1 + x2) / 2.0,
-        (y1 + y2) / 2.0,
-    )
-
-
-def _combined_box(
-    box_a: tuple[
-        float,
-        float,
-        float,
-        float,
-    ],
-    box_b: tuple[
-        float,
-        float,
-        float,
-        float,
-    ],
-) -> tuple[
-    float,
-    float,
-    float,
-    float,
-]:
-
-    return (
-        min(
-            box_a[0],
-            box_b[0],
-        ),
-        min(
-            box_a[1],
-            box_b[1],
-        ),
-        max(
-            box_a[2],
-            box_b[2],
-        ),
-        max(
-            box_a[3],
-            box_b[3],
-        ),
-    )
-
-
 # =========================================================
-# Reliable YOLOS detection
-# =========================================================
-
-def _is_reliable_detection(
-    detection: SignatureDetection,
-) -> bool:
-    """
-    Determine whether a YOLOS detection looks like a
-    plausible signature region.
-
-    This prevents pathological detections such as:
-
-        area_ratio = 0.706
-        width_ratio = 0.95
-        height_ratio = 0.74
-
-    from being treated as a signature region.
-    """
-
-    if detection.confidence <= 0:
-
-        return False
-
-    if detection.area_ratio <= 0:
-
-        return False
-
-    if (
-        detection.area_ratio
-        > MAX_RELIABLE_REGION_AREA_RATIO
-    ):
-
-        return False
-
-    if (
-        detection.width_ratio
-        > MAX_RELIABLE_REGION_WIDTH_RATIO
-    ):
-
-        return False
-
-    if (
-        detection.height_ratio
-        > MAX_RELIABLE_REGION_HEIGHT_RATIO
-    ):
-
-        return False
-
-    return True
-
-
-def _get_reliable_detections(
-    detection: Optional[
-        SignatureDetectionResult
-    ],
-    *,
-    fallback: bool = False,
-) -> list[
-    SignatureDetection
-]:
-    """
-    Filter YOLOS detections by geometry.
-
-    Primary detections only need to pass geometry.
-
-    Fallback detections additionally require a minimum
-    confidence.
-    """
-
-    if (
-        detection is None
-        or not detection.detections
-    ):
-
-        return []
-
-    reliable = []
-
-    for item in detection.detections:
-
-        if not _is_reliable_detection(
-            item
-        ):
-
-            continue
-
-        if fallback:
-
-            if (
-                item.confidence
-                < YOLOS_FALLBACK_MIN_CONFIDENCE
-            ):
-
-                continue
-
-        reliable.append(
-            item
-        )
-
-    return reliable
-
-
-# =========================================================
-# Independent signature detection
+# Independent detections
 # =========================================================
 
 def _get_independent_detections(
@@ -703,26 +593,18 @@ def _get_independent_detections(
     SignatureDetection
 ]:
     """
-    Determine how many independent signature regions exist.
+    Determine the number of independent signature regions.
 
-    Overlapping/nested boxes are treated as one physical
-    signature.
-
-    Additional proximity logic handles cases where YOLOS
-    returns two adjacent boxes belonging to the same
-    handwritten signature.
+    Overlapping/nested YOLOS boxes representing the same
+    physical signature are treated as one.
     """
 
-    reliable = _get_reliable_detections(
-        detection
-    )
-
-    if not reliable:
+    if not detection.detections:
 
         return []
 
     ordered = sorted(
-        reliable,
+        detection.detections,
         key=lambda item: item.confidence,
         reverse=True,
     )
@@ -730,14 +612,6 @@ def _get_independent_detections(
     independent: list[
         SignatureDetection
     ] = []
-
-    image_width = float(
-        ordered[0].image_width
-    )
-
-    image_height = float(
-        ordered[0].image_height
-    )
 
     for candidate in ordered:
 
@@ -780,225 +654,53 @@ def _get_independent_detections(
                 )
             )
 
-            if intersection > 0:
+            if intersection <= 0:
 
-                iou = _calculate_iou(
-                    candidate_box,
-                    accepted_box,
-                )
+                continue
 
-                if (
-                    iou
-                    >= MULTIPLE_SIGNATURE_IOU_THRESHOLD
-                ):
-
-                    duplicate = True
-                    break
-
-                candidate_containment = (
-                    intersection
-                    /
-                    candidate_area
-                )
-
-                if (
-                    candidate_containment
-                    >= MULTIPLE_SIGNATURE_CONTAINMENT_THRESHOLD
-                ):
-
-                    duplicate = True
-                    break
-
-                accepted_containment = (
-                    intersection
-                    /
-                    accepted_area
-                )
-
-                if (
-                    accepted_containment
-                    >= MULTIPLE_SIGNATURE_CONTAINMENT_THRESHOLD
-                ):
-
-                    duplicate = True
-                    break
-
-            # -------------------------------------------------
-            # Additional proximity logic.
-            #
-            # Useful when two boxes are separate but represent
-            # adjacent parts of one handwritten signature.
-            # -------------------------------------------------
-
-            candidate_center = _box_center(
-                candidate_box
-            )
-
-            accepted_center = _box_center(
-                accepted_box
-            )
-
-            horizontal_gap = max(
-                0.0,
-                max(
-                    candidate_box[0],
-                    accepted_box[0],
-                )
-                -
-                min(
-                    candidate_box[2],
-                    accepted_box[2],
-                ),
-            )
-
-            vertical_gap = max(
-                0.0,
-                max(
-                    candidate_box[1],
-                    accepted_box[1],
-                )
-                -
-                min(
-                    candidate_box[3],
-                    accepted_box[3],
-                ),
-            )
-
-            horizontal_overlap = (
-                min(
-                    candidate_box[2],
-                    accepted_box[2],
-                )
-                -
-                max(
-                    candidate_box[0],
-                    accepted_box[0],
-                )
-            )
-
-            horizontal_overlap_ratio = 0.0
-
-            if horizontal_overlap > 0:
-
-                smaller_width = min(
-                    candidate_box[2]
-                    -
-                    candidate_box[0],
-                    accepted_box[2]
-                    -
-                    accepted_box[0],
-                )
-
-                if smaller_width > 0:
-
-                    horizontal_overlap_ratio = (
-                        horizontal_overlap
-                        /
-                        smaller_width
-                    )
-
-            vertical_gap_ratio = (
-                vertical_gap
-                /
-                image_height
+            iou = _calculate_iou(
+                candidate_box,
+                accepted_box,
             )
 
             if (
-                vertical_gap_ratio
-                <= VERTICAL_PROXIMITY_THRESHOLD
+                iou
+                >= MULTIPLE_SIGNATURE_IOU_THRESHOLD
             ):
 
-                center_y_difference = abs(
-                    candidate_center[1]
-                    -
-                    accepted_center[1]
-                )
+                duplicate = True
 
-                average_height = (
-                    (
-                        candidate_box[3]
-                        -
-                        candidate_box[1]
-                    )
-                    +
-                    (
-                        accepted_box[3]
-                        -
-                        accepted_box[1]
-                    )
-                ) / 2.0
+                break
 
-                if average_height > 0:
+            candidate_containment = (
+                intersection
+                /
+                candidate_area
+            )
 
-                    center_y_ratio = (
-                        center_y_difference
-                        /
-                        average_height
-                    )
+            if (
+                candidate_containment
+                >= MULTIPLE_SIGNATURE_CONTAINMENT_THRESHOLD
+            ):
 
-                    if (
-                        center_y_ratio
-                        <= CENTER_VERTICAL_RATIO_THRESHOLD
-                    ):
+                duplicate = True
 
-                        if (
-                            horizontal_overlap_ratio
-                            >= 0.20
-                        ):
+                break
 
-                            duplicate = True
-                            break
+            accepted_containment = (
+                intersection
+                /
+                accepted_area
+            )
 
-                        # -------------------------------------------------
-                        # Horizontally adjacent parts.
-                        #
-                        # If their combined area is reasonable, they can
-                        # be parts of the same signature.
-                        # -------------------------------------------------
+            if (
+                accepted_containment
+                >= MULTIPLE_SIGNATURE_CONTAINMENT_THRESHOLD
+            ):
 
-                        combined = _combined_box(
-                            candidate_box,
-                            accepted_box,
-                        )
+                duplicate = True
 
-                        combined_area = _box_area(
-                            combined
-                        )
-
-                        image_area = (
-                            image_width
-                            *
-                            image_height
-                        )
-
-                        combined_area_ratio = (
-                            combined_area
-                            /
-                            image_area
-                            if image_area > 0
-                            else 1.0
-                        )
-
-                        if (
-                            combined_area_ratio
-                            <= MAX_COMBINED_AREA_RATIO
-                        ):
-
-                            if (
-                                horizontal_gap
-                                <= (
-                                    0.08
-                                    *
-                                    image_width
-                                )
-                            ):
-
-                                duplicate = True
-                                break
-
-            # Avoid unused variable warnings and keep the
-            # geometric calculation explicit.
-            _ = horizontal_gap
+                break
 
         if not duplicate:
 
@@ -1010,42 +712,42 @@ def _get_independent_detections(
 
 
 # =========================================================
-# OpenCV fallback region plausibility
+# Graphic / logo detector
 # =========================================================
 
-def _opencv_region_fallback(
+def _looks_like_graphic_signature(
     features: SignatureFeatures,
 ) -> bool:
     """
-    Determine whether the OpenCV feature geometry itself
-    provides enough evidence for a plausible signature region.
+    Detect a graphic/logo-like signature representation.
 
-    This is deliberately conservative.
+    This function does NOT identify a particular company or
+    image.
 
-    It does NOT claim that the image is definitely a
-    signature. It only allows the pipeline to continue when
-    MobileNet is already highly confident and the image
-    geometry looks signature-like.
+    It uses general visual structure only.
+
+    Returns True when the image has a suspicious combination
+    of:
+
+        - relatively high foreground density
+        - large occupied region
+        - few connected components
+        - dominant contour
+
+    This is a safety guard against automatically accepting
+    signature-like graphics.
     """
 
     foreground = float(
         features.foreground_density
     )
 
-    occupancy = float(
-        features.occupancy_ratio
-    )
-
-    aspect_ratio = float(
-        features.aspect_ratio
-    )
-
     components = int(
         features.connected_components
     )
 
-    contour_count = int(
-        features.contour_count
+    occupancy = float(
+        features.occupancy_ratio
     )
 
     largest_contour = float(
@@ -1056,27 +758,22 @@ def _opencv_region_fallback(
         features.total_contour_area
     )
 
+    image_width = int(
+        features.image_width
+    )
+
+    image_height = int(
+        features.image_height
+    )
+
     # -----------------------------------------------------
-    # Basic sanity.
+    # Basic protection.
     # -----------------------------------------------------
 
-    if foreground <= 0:
-
-        return False
-
-    if foreground > 0.15:
-
-        return False
-
-    if components <= 0:
-
-        return False
-
-    if contour_count <= 0:
-
-        return False
-
-    if largest_contour <= 0:
+    if (
+        image_width <= 0
+        or image_height <= 0
+    ):
 
         return False
 
@@ -1084,76 +781,258 @@ def _opencv_region_fallback(
 
         return False
 
-    # -----------------------------------------------------
-    # Occupancy.
-    #
-    # Very tiny or almost full-image occupancy is suspicious.
-    # -----------------------------------------------------
-
-    if occupancy < 0.005:
-
-        return False
-
-    if occupancy > 0.50:
-
-        return False
-
-    # -----------------------------------------------------
-    # Aspect ratio.
-    #
-    # Signatures can vary considerably, therefore this is
-    # intentionally broad.
-    # -----------------------------------------------------
-
-    if aspect_ratio <= 0:
-
-        return False
-
-    if aspect_ratio > 8.0:
-
-        return False
-
-    # -----------------------------------------------------
-    # Reasonable contour structure.
-    # -----------------------------------------------------
-
-    if components > HIGH_COMPONENT_COUNT:
-
-        return False
-
-    if contour_count > HIGH_COMPONENT_COUNT:
-
-        return False
-
-    # -----------------------------------------------------
-    # Large amount of dense contour area is suspicious.
-    # -----------------------------------------------------
-
     image_area = (
-        float(features.image_width)
+        image_width
         *
-        float(features.image_height)
+        image_height
     )
 
     if image_area <= 0:
 
         return False
 
-    contour_area_ratio = (
+    # -----------------------------------------------------
+    # Dominant contour ratio.
+    # -----------------------------------------------------
+
+    dominant_contour_ratio = (
+        largest_contour
+        /
         total_contour
+    )
+
+    # -----------------------------------------------------
+    # Largest contour relative to image.
+    # -----------------------------------------------------
+
+    largest_contour_image_ratio = (
+        largest_contour
         /
         image_area
     )
 
-    if contour_area_ratio > 0.20:
+    # =====================================================
+    # Rule 1
+    # =====================================================
+
+    dominant_contour = (
+        dominant_contour_ratio
+        >= GRAPHIC_DOMINANT_CONTOUR_RATIO
+    )
+
+    large_structured_region = (
+        foreground
+        >= GRAPHIC_MIN_FOREGROUND_DENSITY
+        and
+        occupancy
+        >= GRAPHIC_MIN_OCCUPANCY_RATIO
+        and
+        components
+        <= GRAPHIC_MAX_COMPONENTS
+    )
+
+    if (
+        dominant_contour
+        and
+        large_structured_region
+    ):
+
+        return True
+
+    # =====================================================
+    # Rule 2
+    # =====================================================
+
+    very_large_contour = (
+        largest_contour_image_ratio
+        >= GRAPHIC_LARGE_CONTOUR_IMAGE_RATIO
+    )
+
+    if (
+        very_large_contour
+        and
+        components
+        <= GRAPHIC_MAX_COMPONENTS
+        and
+        occupancy
+        >= GRAPHIC_MIN_OCCUPANCY_RATIO
+    ):
+
+        return True
+
+    return False
+
+
+# =========================================================
+# Fast path candidate
+# =========================================================
+
+def _is_fast_path_candidate(
+    features: SignatureFeatures,
+    classifier: SignatureClassifierResult,
+) -> bool:
+    """
+    Determine whether YOLOS can be skipped.
+
+    Requirements:
+
+        1. Very high MobileNet confidence.
+        2. Low foreground density.
+        3. Reasonable connected components.
+        4. Reasonable occupancy.
+        5. Reasonable aspect ratio.
+        6. Not a graphic-like image.
+    """
+
+    if (
+        classifier.signature_probability
+        < FAST_ACCEPT_CLASSIFIER_THRESHOLD
+    ):
+
+        return False
+
+    if (
+        features.foreground_density
+        > FAST_MAX_FOREGROUND_DENSITY
+    ):
+
+        return False
+
+    if (
+        features.connected_components
+        > FAST_MAX_COMPONENTS
+    ):
+
+        return False
+
+    if (
+        features.connected_components
+        < FAST_MIN_COMPONENTS
+    ):
+
+        return False
+
+    occupancy = float(
+        features.occupancy_ratio
+    )
+
+    if (
+        occupancy
+        < FAST_MIN_OCCUPANCY_RATIO
+    ):
+
+        return False
+
+    if (
+        occupancy
+        > FAST_MAX_OCCUPANCY_RATIO
+    ):
+
+        return False
+
+    aspect_ratio = float(
+        features.aspect_ratio
+    )
+
+    if (
+        aspect_ratio
+        < FAST_MIN_ASPECT_RATIO
+    ):
+
+        return False
+
+    if (
+        aspect_ratio
+        > FAST_MAX_ASPECT_RATIO
+    ):
 
         return False
 
     # -----------------------------------------------------
-    # If all checks pass, geometry is plausible.
+    # IMPORTANT:
+    # Never fast-accept a graphic-like image.
     # -----------------------------------------------------
 
+    if _looks_like_graphic_signature(
+        features
+    ):
+
+        return False
+
     return True
+
+
+# =========================================================
+# Suspicious OpenCV context
+# =========================================================
+
+def _has_suspicious_context(
+    features: SignatureFeatures,
+) -> bool:
+    """
+    Cheap OpenCV-only suspiciousness check.
+    """
+
+    if (
+        features.foreground_density
+        > MAX_FOREGROUND_DENSITY
+    ):
+
+        return True
+
+    if (
+        features.connected_components
+        >= HIGH_COMPONENT_COUNT
+    ):
+
+        return True
+
+    if (
+        features.contour_count
+        >= HIGH_COMPONENT_COUNT
+    ):
+
+        return True
+
+    return False
+
+
+# =========================================================
+# Timing logger
+# =========================================================
+
+def _print_timing(
+    total_start: float,
+    feature_ms: float,
+    classifier_ms: float,
+    detection_ms: float = 0.0,
+    context_ms: float = 0.0,
+    yolos_used: bool = False,
+) -> None:
+
+    if not ENABLE_TIMING_LOG:
+
+        return
+
+    total_ms = (
+        time.perf_counter()
+        -
+        total_start
+    ) * 1000
+
+    print(
+        "\n"
+        "========================================\n"
+        "SIGNATURE TIMING\n"
+        "========================================\n"
+        f"Features   : {feature_ms:.2f} ms\n"
+        f"Classifier : {classifier_ms:.2f} ms\n"
+        f"YOLOS      : {detection_ms:.2f} ms\n"
+        f"Context    : {context_ms:.2f} ms\n"
+        f"Total      : {total_ms:.2f} ms\n"
+        f"YOLOS used : {yolos_used}\n"
+        "========================================"
+    )
 
 
 # =========================================================
@@ -1169,24 +1048,29 @@ def validate_signature(
     """
     Validate a signature image.
 
-    MobileNetV3:
-        Primary classifier.
+    Fast path:
 
-    YOLOS:
-        Region detection.
+        OpenCV
+        +
+        MobileNet
+        +
+        graphic guard
 
-    OpenCV:
-        Geometry fallback.
+    Escalation path:
 
-    Input modes:
-
-        upload
-        draw
-        capture
+        OpenCV
+        +
+        MobileNet
+        +
+        YOLOS
+        +
+        context
     """
 
+    total_start = time.perf_counter()
+
     # =====================================================
-    # 1. Normalize input mode
+    # 1. Input mode
     # =====================================================
 
     try:
@@ -1241,8 +1125,10 @@ def validate_signature(
         )
 
     # =====================================================
-    # 3. Extract OpenCV features
+    # 3. OpenCV features
     # =====================================================
+
+    feature_start = time.perf_counter()
 
     try:
 
@@ -1261,8 +1147,14 @@ def validate_signature(
             )
         )
 
+    feature_ms = (
+        time.perf_counter()
+        -
+        feature_start
+    ) * 1000
+
     # =====================================================
-    # 4. Blank image
+    # 4. Blank
     # =====================================================
 
     if (
@@ -1303,10 +1195,10 @@ def validate_signature(
         )
 
     # =====================================================
-    # 6. MobileNet classifier
+    # 6. MobileNet
     # =====================================================
 
-    classifier = None
+    classifier_start = time.perf_counter()
 
     try:
 
@@ -1327,6 +1219,12 @@ def validate_signature(
             context=None,
         )
 
+    classifier_ms = (
+        time.perf_counter()
+        -
+        classifier_start
+    ) * 1000
+
     # =====================================================
     # 7. Non-signature
     # =====================================================
@@ -1345,7 +1243,7 @@ def validate_signature(
         )
 
     # =====================================================
-    # 8. Weak signature confidence
+    # 8. Weak confidence
     # =====================================================
 
     if (
@@ -1365,7 +1263,7 @@ def validate_signature(
         )
 
     # =====================================================
-    # 9. Medium signature confidence
+    # 9. Medium confidence
     # =====================================================
 
     if (
@@ -1389,8 +1287,82 @@ def validate_signature(
         )
 
     # =====================================================
-    # 10. Primary YOLOS detection
+    # 10. GRAPHIC / LOGO GUARD
     # =====================================================
+
+    """
+    This is intentionally BEFORE the fast acceptance.
+
+    A model confidence of 0.999+ is not enough.
+
+    If the image has a strong graphic-like structure,
+    reject it instead of allowing MobileNet to override
+    the structural evidence.
+    """
+
+    if _looks_like_graphic_signature(
+        features
+    ):
+
+        return _reject(
+            reason_code="GRAPHIC_SIGNATURE_REJECTED",
+            message=(
+                "The image is strongly classified "
+                "as signature-like, but its visual "
+                "structure is more consistent with "
+                "a graphic, logo, or non-handwritten "
+                "signature image."
+            ),
+            features=features,
+            classifier=classifier,
+            context=None,
+        )
+
+    # =====================================================
+    # 11. Suspicious OpenCV context
+    # =====================================================
+
+    suspicious = _has_suspicious_context(
+        features
+    )
+
+    # =====================================================
+    # 12. FAST PATH
+    # =====================================================
+
+    fast_path = _is_fast_path_candidate(
+        features=features,
+        classifier=classifier,
+    )
+
+    if (
+        fast_path
+        and not suspicious
+    ):
+
+        _print_timing(
+            total_start=total_start,
+            feature_ms=feature_ms,
+            classifier_ms=classifier_ms,
+            yolos_used=False,
+        )
+
+        return _accept(
+            reason_code="SIGNATURE_CANDIDATE",
+            message=(
+                "Image contains a high-confidence "
+                "signature candidate."
+            ),
+            features=features,
+            classifier=classifier,
+            context=None,
+        )
+
+    # =====================================================
+    # 13. YOLOS
+    # =====================================================
+
+    detection_start = time.perf_counter()
 
     detection: Optional[
         SignatureDetectionResult
@@ -1399,8 +1371,7 @@ def validate_signature(
     try:
 
         detection = detect_signatures(
-            image=image,
-            threshold=YOLOS_PRIMARY_THRESHOLD,
+            image=image
         )
 
     except Exception as exc:
@@ -1416,179 +1387,36 @@ def validate_signature(
             context=None,
         )
 
-    # =====================================================
-    # 11. Filter primary YOLOS detections
-    # =====================================================
-
-    primary_reliable = (
-        _get_reliable_detections(
-            detection
-        )
-    )
+    detection_ms = (
+        time.perf_counter()
+        -
+        detection_start
+    ) * 1000
 
     # =====================================================
-    # 12. Fallback YOLOS detection
-    #
-    # Only execute when MobileNet is extremely confident
-    # and the primary YOLOS detector found no reliable region.
+    # 14. No region
     # =====================================================
 
     if (
-        not primary_reliable
-        and
-        classifier.signature_probability
-        >= 0.95
+        detection is None
+        or not detection.detected
+        or not detection.detections
     ):
 
-        try:
-
-            fallback_detection = (
-                detect_signatures(
-                    image=image,
-                    threshold=(
-                        YOLOS_FALLBACK_THRESHOLD
-                    ),
-                )
-            )
-
-            fallback_reliable = (
-                _get_reliable_detections(
-                    fallback_detection,
-                    fallback=True,
-                )
-            )
-
-            if fallback_reliable:
-
-                detection = (
-                    fallback_detection
-                )
-
-                primary_reliable = (
-                    fallback_reliable
-                )
-
-        except Exception:
-            # Do not fail the whole validation because the
-            # fallback detector failed.
-            pass
-
-    # =====================================================
-    # 13. No reliable YOLOS region
-    # =====================================================
-
-    if not primary_reliable:
-
-        # -------------------------------------------------
-        # OpenCV geometry fallback.
-        # -------------------------------------------------
-
-        if _opencv_region_fallback(
-            features
-        ):
-
-            try:
-
-                context = analyze_image_context(
-                    image=image,
-                    signature_result=(
-                        detection
-                        if detection is not None
-                        else SignatureDetectionResult(
-                            detected=False,
-                            detection_count=0,
-                            highest_score=0.0,
-                            largest_area_ratio=0.0,
-                            multiple_signatures=False,
-                            detections=[],
-                        )
-                    ),
-                )
-
-            except Exception as exc:
-
-                return _review(
-                    reason_code="CONTEXT_ANALYSIS_ERROR",
-                    message=(
-                        "Whole-image context analysis "
-                        f"failed: {exc}"
-                    ),
-                    features=features,
-                    classifier=classifier,
-                    context=None,
-                )
-
-            # -------------------------------------------------
-            # Strong document context still overrides.
-            # -------------------------------------------------
-
-            document_signals = 0
-
-            if (
-                context.connected_components
-                >= HIGH_COMPONENT_COUNT
-            ):
-
-                document_signals += 1
-
-            if (
-                context.edge_density
-                >= HIGH_EDGE_DENSITY
-            ):
-
-                document_signals += 1
-
-            if (
-                context.connected_components
-                >= DOCUMENT_CONTEXT_COMPONENTS
-                and
-                context.signature_area_ratio
-                < SMALL_SIGNATURE_AREA_RATIO
-            ):
-
-                document_signals += 1
-
-            if context.document_like:
-
-                document_signals += 1
-
-            if document_signals >= 2:
-
-                return _review(
-                    reason_code="DOCUMENT_CONTEXT",
-                    message=(
-                        "The image contains a "
-                        "high-confidence signature "
-                        "classification but also "
-                        "shows strong document context."
-                    ),
-                    features=features,
-                    classifier=classifier,
-                    context=context,
-                )
-
-            return _accept(
-                reason_code="SIGNATURE_CANDIDATE",
-                message=(
-                    "Image contains a high-confidence "
-                    "signature candidate supported by "
-                    "image geometry."
-                ),
-                features=features,
-                classifier=classifier,
-                context=context,
-            )
-
-        # -------------------------------------------------
-        # Geometry fallback did not support it.
-        # -------------------------------------------------
+        _print_timing(
+            total_start=total_start,
+            feature_ms=feature_ms,
+            classifier_ms=classifier_ms,
+            detection_ms=detection_ms,
+            yolos_used=True,
+        )
 
         return _review(
             reason_code="SIGNATURE_REGION_NOT_FOUND",
             message=(
                 "The classifier detected a signature, "
                 "but no reliable signature region "
-                "was detected by the region detector."
+                "was detected."
             ),
             features=features,
             classifier=classifier,
@@ -1596,35 +1424,12 @@ def validate_signature(
         )
 
     # =====================================================
-    # 14. Independent signature analysis
+    # 15. Independent detections
     # =====================================================
-
-    # Construct a clean detection result containing only
-    # reliable detections.
-    reliable_result = (
-        SignatureDetectionResult(
-            detected=True,
-            detection_count=len(
-                primary_reliable
-            ),
-            highest_score=max(
-                item.confidence
-                for item in primary_reliable
-            ),
-            largest_area_ratio=max(
-                item.area_ratio
-                for item in primary_reliable
-            ),
-            multiple_signatures=(
-                len(primary_reliable) > 1
-            ),
-            detections=primary_reliable,
-        )
-    )
 
     independent_detections = (
         _get_independent_detections(
-            reliable_result
+            detection
         )
     )
 
@@ -1633,10 +1438,18 @@ def validate_signature(
     )
 
     # =====================================================
-    # 15. Multiple signatures
+    # 16. Multiple signatures
     # =====================================================
 
     if independent_count > 1:
+
+        _print_timing(
+            total_start=total_start,
+            feature_ms=feature_ms,
+            classifier_ms=classifier_ms,
+            detection_ms=detection_ms,
+            yolos_used=True,
+        )
 
         return _review(
             reason_code="MULTIPLE_SIGNATURES",
@@ -1651,14 +1464,16 @@ def validate_signature(
         )
 
     # =====================================================
-    # 16. Whole-image context
+    # 17. Whole-image context
     # =====================================================
+
+    context_start = time.perf_counter()
 
     try:
 
         context = analyze_image_context(
             image=image,
-            signature_result=reliable_result,
+            signature_result=detection,
         )
 
     except Exception as exc:
@@ -1674,8 +1489,14 @@ def validate_signature(
             context=None,
         )
 
+    context_ms = (
+        time.perf_counter()
+        -
+        context_start
+    ) * 1000
+
     # =====================================================
-    # 17. Document context
+    # 18. Document context
     # =====================================================
 
     document_signals = 0
@@ -1709,10 +1530,19 @@ def validate_signature(
         document_signals += 1
 
     # =====================================================
-    # 18. Strong document context
+    # 19. Strong document context
     # =====================================================
 
     if document_signals >= 2:
+
+        _print_timing(
+            total_start=total_start,
+            feature_ms=feature_ms,
+            classifier_ms=classifier_ms,
+            detection_ms=detection_ms,
+            context_ms=context_ms,
+            yolos_used=True,
+        )
 
         return _review(
             reason_code="DOCUMENT_CONTEXT",
@@ -1728,13 +1558,22 @@ def validate_signature(
         )
 
     # =====================================================
-    # 19. High-confidence signature
+    # 20. High confidence after YOLOS
     # =====================================================
 
     if (
         classifier.signature_probability
         >= SIGNATURE_ACCEPT_THRESHOLD
     ):
+
+        _print_timing(
+            total_start=total_start,
+            feature_ms=feature_ms,
+            classifier_ms=classifier_ms,
+            detection_ms=detection_ms,
+            context_ms=context_ms,
+            yolos_used=True,
+        )
 
         return _accept(
             reason_code="SIGNATURE_CANDIDATE",
@@ -1748,8 +1587,17 @@ def validate_signature(
         )
 
     # =====================================================
-    # 20. Fallback
+    # 21. Fallback
     # =====================================================
+
+    _print_timing(
+        total_start=total_start,
+        feature_ms=feature_ms,
+        classifier_ms=classifier_ms,
+        detection_ms=detection_ms,
+        context_ms=context_ms,
+        yolos_used=True,
+    )
 
     return _review(
         reason_code="REVIEW_REQUIRED",
